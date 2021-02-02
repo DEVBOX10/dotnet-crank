@@ -16,8 +16,11 @@ namespace Microsoft.Crank.RegressionBot.Models
         public string Scenario { get; set; }
         public string Description { get; set; }
         public string Document { get; set; }
-        
+
+        [MessagePack.IgnoreMember]
         private JObject _data;
+
+        [MessagePack.IgnoreMember]
         public JObject Data => _data ??= JObject.Parse(Document);
     }
 }

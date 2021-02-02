@@ -22,11 +22,10 @@ using Microsoft.Crank.Models;
 using BenchmarksServer;
 using McMaster.Extensions.CommandLineUtils;
 using Microsoft.AspNetCore.Builder;
-using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Hosting;
-using Microsoft.Diagnostics.Tools.RuntimeClient;
 using Microsoft.Diagnostics.Tools.Trace;
 using Microsoft.Diagnostics.Tracing;
+using Microsoft.Diagnostics.NETCore.Client;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -35,6 +34,7 @@ using Newtonsoft.Json.Linq;
 using Repository;
 using OperatingSystem = Microsoft.Crank.Models.OperatingSystem;
 using NuGet.Versioning;
+using System.Net;
 
 namespace Microsoft.Crank.Agent
 {
@@ -75,7 +75,7 @@ namespace Microsoft.Crank.Agent
         //private static readonly string _latestDesktopApiUrl = "https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet5/nuget/v3/flat2/Microsoft.NetCore.App.Runtime.win-x64/index.json";
         //private static readonly string _releaseMetadata = "https://dotnetcli.blob.core.windows.net/dotnet/release-metadata/releases-index.json";
 
-        // private static readonly string _latestSdkVersionUrl = "https://aka.ms/dotnet/net6/dev/Sdk/productCommit-win-x64.txt";
+        private static readonly string _latestSdkVersionUrl = "https://aka.ms/dotnet/net6/dev/Sdk/productCommit-win-x64.txt";
         
         private static readonly string _aspnetSdkVersionUrl = "https://raw.githubusercontent.com/dotnet/aspnetcore/master/global.json";
         private static readonly string[] _runtimeFeedUrls = new string[] {
@@ -92,7 +92,7 @@ namespace Microsoft.Crank.Agent
         private static readonly HashSet<string> _installedSdks = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         private const string _defaultUrl = "http://*:5010";
-        private static readonly string _defaultHostname = Environment.MachineName.ToLowerInvariant();
+        private static readonly string _defaultHostname = Dns.GetHostName();
         private static string _perfviewPath;
         private static string _dotnetInstallPath;
 
@@ -119,7 +119,7 @@ namespace Microsoft.Crank.Agent
         public static TimeSpan StartTimeout = TimeSpan.FromMinutes(3);
         public static TimeSpan DefaultBuildTimeout = TimeSpan.FromMinutes(10);
         public static TimeSpan DeletedTimeout = TimeSpan.FromHours(18);
-        public static TimeSpan PerfCollectTimeout = TimeSpan.FromMinutes(2);
+        public static TimeSpan CollectTimeout = TimeSpan.FromMinutes(5);
 
         private static string _startPerfviewArguments;
 
@@ -127,9 +127,9 @@ namespace Microsoft.Crank.Agent
         private static Task eventPipeTask = null;
         private static bool eventPipeTerminated = false;
 
-        private static ulong measurementsSessionId = 0;
-        private static Task measurementsTask = null;
-        private static bool measurementsTerminated = false;
+        private static EventPipeSession eventPipeSession = null;
+        private static Task countersTask = null;
+        private static TaskCompletionSource<bool> countersCompletionSource = null;
 
         static Startup()
         {
@@ -206,6 +206,8 @@ namespace Microsoft.Crank.Agent
             var dockerHostnameOption = app.Option("-nd|--docker-hostname", $"Hostname for benchmark server when running Docker on a different hostname.",
                 CommandOptionType.SingleValue);
             var hardwareOption = app.Option("--hardware", "Hardware (Cloud or Physical).  Required.",
+                CommandOptionType.SingleValue);
+            var dotnethomeOption = app.Option("--dotnethome", "Folder to reuse for sdk and runtime installs.",
                 CommandOptionType.SingleValue);
             var hardwareVersionOption = app.Option("--hardware-version", "Hardware version (e.g, D3V2, Z420, ...).  Required.",
                 CommandOptionType.SingleValue);
@@ -290,6 +292,11 @@ namespace Microsoft.Crank.Agent
                 var hostname = hostnameOption.HasValue() ? hostnameOption.Value() : _defaultHostname;
                 var dockerHostname = dockerHostnameOption.HasValue() ? dockerHostnameOption.Value() : hostname;
 
+                if (dotnethomeOption.HasValue())
+                {
+                    InitializeDotnetHome(dotnethomeOption.Value());
+                }
+
                 return Run(url, hostname, dockerHostname).Result;
             });
 
@@ -325,6 +332,71 @@ namespace Microsoft.Crank.Agent
             await processJobsTask;
 
             return 0;
+        }
+
+        private static void InitializeDotnetHome(string dotnethome)
+        {
+            if (String.IsNullOrEmpty(dotnethome))
+            {
+                return;
+            }
+
+            if (!Directory.Exists(dotnethome))
+            {
+                Directory.CreateDirectory(dotnethome);
+            }
+
+            Log.WriteLine($"Using existing dotnet home folder: {dotnethome}");
+
+            var sdkLocation = Path.Combine(dotnethome, "sdk");
+
+            if (Directory.Exists(sdkLocation))
+            {
+                foreach (var sdkFolder in Directory.GetDirectories(sdkLocation))
+                {
+                    var sdkVersion = new DirectoryInfo(sdkFolder).Name;
+                    _installedSdks.Add(sdkVersion);
+                    Log.WriteLine($"Found sdk {sdkVersion}");
+                }
+            }
+            
+            var runtimeLocation = Path.Combine(dotnethome, "shared", "Microsoft.NETCore.App");
+
+            if (Directory.Exists(runtimeLocation))
+            {
+                foreach (var runtimeFolder in Directory.GetDirectories(runtimeLocation))
+                {
+                    var runtimeVersion = new DirectoryInfo(runtimeFolder).Name;
+                    _installedDotnetRuntimes.Add(runtimeVersion);
+                    Log.WriteLine($"Found runtime {runtimeVersion}");
+                }
+            }
+
+            var aspnetLocation = Path.Combine(dotnethome, "shared", "Microsoft.AspNetCore.App");
+
+            if (Directory.Exists(aspnetLocation))
+            {
+                foreach (var aspnetFolder in Directory.GetDirectories(aspnetLocation))
+                {
+                    var aspnetVersion = new DirectoryInfo(aspnetFolder).Name;
+                    _installedAspNetRuntimes.Add(aspnetVersion);
+                    Log.WriteLine($"Found aspnet {aspnetVersion}");
+                }
+            }
+
+            var desktopLocation = Path.Combine(dotnethome, "shared", "Microsoft.WindowsDesktop.App");
+
+            if (Directory.Exists(desktopLocation))
+            {
+                foreach (var windowsFolder in Directory.GetDirectories(desktopLocation))
+                {
+                    var desktopVersion = new DirectoryInfo(windowsFolder).Name;
+                    _installedDesktopRuntimes.Add(desktopVersion);
+                    Log.WriteLine($"Found desktop {desktopVersion}");
+                }
+            }
+
+            _dotnethome = dotnethome;
         }
 
         private static async Task ProcessJobs(string hostname, string dockerHostname, CancellationToken cancellationToken)
@@ -414,7 +486,6 @@ namespace Microsoft.Crank.Agent
                             var context = group[job];
 
                             Log.WriteLine($"Processing job '{job.Service}' ({job.Id}) in state {job.State}");
-
                             // Restore context for the current job
                             var process = context.Process;
 
@@ -430,9 +501,9 @@ namespace Microsoft.Crank.Agent
                             eventPipeTask = context.EventPipeTask;
                             eventPipeTerminated = context.EventPipeTerminated;
 
-                            measurementsSessionId = context.MeasurementsSessionId;
-                            measurementsTask = context.MeasurementsTask;
-                            measurementsTerminated = context.MeasurementsTerminated;
+                            eventPipeSession = context.EventPipeSession;
+                            countersTask = context.CountersTask;
+                            countersCompletionSource = context.CountersCompletionSource;
 
                             if (job.State == JobState.New)
                             {
@@ -452,6 +523,39 @@ namespace Microsoft.Crank.Agent
                                 }
                                 else
                                 {
+                                    tempDir = null;
+
+                                    if (!String.IsNullOrEmpty(job.Source.SourceKey))
+                                    {
+                                        tempDir = Path.Combine(_rootTempDir, job.Source.SourceKey);
+
+                                        try
+                                        {
+                                            if (!Directory.Exists(tempDir))
+                                            {
+                                                Log.WriteLine("Creating source folder: " + tempDir);
+                                                Directory.CreateDirectory(tempDir);
+                                            }
+                                            else
+                                            {
+                                                Log.WriteLine("Found source folder: " + tempDir);
+
+                                                // Force the controller to not send the local folder
+                                                job.Source.LocalFolder = null;
+                                            }
+                                        }
+                                        catch
+                                        {
+                                            Log.WriteLine("[WARNING] Invalid source folder name: " + tempDir);
+                                            tempDir = null;
+                                        }
+                                    }
+
+                                    if (tempDir == null)
+                                    {
+                                        tempDir = GetTempDir();
+                                    }
+
                                     startMonitorTime = DateTime.UtcNow;
                                     Log.WriteLine($"{job.State} -> Initializing");
                                     job.State = JobState.Initializing;
@@ -595,8 +699,6 @@ namespace Microsoft.Crank.Agent
 
                                     startMonitorTime = DateTime.UtcNow;
 
-                                    Debug.Assert(tempDir == null);
-                                    tempDir = GetTempDir();
                                     workingDirectory = null;
                                     dockerImage = null;
 
@@ -651,7 +753,12 @@ namespace Microsoft.Crank.Agent
                                             job.State = JobState.Failed;
 
                                             cts.Cancel();
-                                            await buildAndRunTask;
+                                            await Task.WhenAny(buildAndRunTask, Task.Delay(5000));
+
+                                            if (!buildAndRunTask.IsCompleted)
+                                            {
+                                                Log.WriteLine($"Build couldn't not be interrupted");
+                                            }
                                         }
 
                                         // Cancel the build if it's taking too long
@@ -703,6 +810,7 @@ namespace Microsoft.Crank.Agent
                                             {
                                                 if (context.Disposed || context.Timer == null)
                                                 {
+                                                    Log.WriteLine($"[Warning!!!] Heartbeat still active while context is disposed ({job.Service})");
                                                     return;
                                                 }
 
@@ -716,11 +824,15 @@ namespace Microsoft.Crank.Agent
                                                     // Stops the job in case the driver is not running
                                                     if (now - job.LastDriverCommunicationUtc > DriverTimeout)
                                                     {
-                                                        Log.WriteLine($"[Heartbeat] Driver didn't communicate for {DriverTimeout}. Halting job '{job.Service}' ({job.Id}).");
-                                                        if (job.State == JobState.Running || job.State == JobState.TraceCollected)
+                                                        if (job.State == JobState.Running)
                                                         {
+                                                            Log.WriteLine($"[Heartbeat] Driver didn't communicate for {DriverTimeout}. Halting job '{job.Service}' ({job.Id}).");
                                                             Log.WriteLine($"{job.State} -> Stopping");
                                                             job.State = JobState.Stopping;
+                                                        }
+                                                        else
+                                                        {
+                                                            Log.WriteLine($"Heartbeat is active ({job.Service}), job is '{job.State}' and driver is AWOL. Job deletion must have failed.");
                                                         }
                                                     }
 
@@ -1016,7 +1128,7 @@ namespace Microsoft.Crank.Agent
                                     }
                                     else if (OperatingSystem == OperatingSystem.Linux)
                                     {
-                                        await StopPerfcollectAsync(perfCollectProcess);
+                                        await StopPerfcollectAsync(job, perfCollectProcess);
                                     }
 
                                     Log.WriteLine("Trace collected");
@@ -1052,9 +1164,6 @@ namespace Microsoft.Crank.Agent
                                     Log.WriteLine($"{job.State} ->  TraceCollected");
                                     job.State = JobState.TraceCollected;
                                 }
-
-                                StopCounters();
-
                             }
                             else if (job.State == JobState.Starting)
                             {
@@ -1093,50 +1202,71 @@ namespace Microsoft.Crank.Agent
 
                             void StopCounters()
                             {
-                                // Releasing EventPipe
-                                if (eventPipeTask != null)
+                                // Releasing Counters
+                                
+                                Log.WriteLine($"Stopping counters event pipes for job '{job.Service}' ({job.Id})");
+                                
+                                try
                                 {
-                                    try
+                                    if (countersTask != null && countersCompletionSource != null)
                                     {
-                                        Log.WriteLine($"Stopping counter event pipes for job '{job.Service}' ({job.Id})");
-                                        if (process != null && !eventPipeTerminated && !process.HasExited)
+                                        countersCompletionSource.SetResult(true);
+
+                                        Task.WaitAny(new Task[] { countersTask }, 5000);
+
+                                        if (!countersTask.IsCompleted)
                                         {
-                                            EventPipeClient.StopTracing(process.Id, eventPipeSessionId);
+                                            Log.WriteLine($"[ERROR] Counters could not be stopped in time for job '{job.Service}' ({job.Id})");
                                         }
+                                        
+                                        Log.WriteLine($"Counters stopped for job '{job.Service}' ({job.Id})");
                                     }
-                                    catch (EndOfStreamException)
+                                    else
                                     {
-                                        // If the app we're monitoring exits abruptly, this may throw in which case we just swallow the exception and exit gracefully.
+                                        Log.WriteLine($"[WARNING] No event source open for job '{job.Service}' ({job.Id})");
                                     }
-                                                                        
-                                    eventPipeTask = null;
                                 }
-                            }
-
-                            void StopMeasurement()
-                            {
-                                // Releasing Measurements
-                                if (measurementsTask != null)
+                                catch (Exception e)
                                 {
-                                    try
-                                    {
-                                        Log.WriteLine($"Stopping measurement event pipes for job '{job.Service}' ({job.Id})");
-                                        if (process != null && !measurementsTerminated && !process.HasExited)
-                                        {
-                                            EventPipeClient.StopTracing(process.Id, measurementsSessionId);
-                                        }
-                                    }
-                                    catch (EndOfStreamException)
-                                    {
-                                        // If the app we're monitoring exits abruptly, this may throw in which case we just swallow the exception and exit gracefully.
-                                    }
-
-                                    measurementsTask = null;
+                                    Log.WriteLine("Error in StopCounters(): " + e.ToString());
+                                }
+                                finally
+                                {
+                                    countersTask = null;
+                                    countersCompletionSource = null;
                                 }
                             }
 
                             async Task StopJobAsync(bool abortCollection = false)
                             {
+                                // Check if we already passed here
+                                if (context.Timer == null)
+                                {
+                                    return;
+                                }
+
+                                Log.Write($"Stopping heartbeat ({job.Service})");
+                                    
+                                Monitor.Enter(_synLock);
+
+                                try
+                                {
+                                    context.Timer?.Dispose();
+                                    Log.WriteLine("... Success!", false);
+                                }
+                                catch (Exception e)
+                                {
+                                    Log.WriteLine("... Error!", false);
+                                    Log.WriteLine(e.ToString());
+                                }
+                                finally
+                                {
+                                    context.Timer = null;
+                                    context.Disposed = true;
+
+                                    Monitor.Exit(_synLock);
+                                }
+
                                 // Delete the benchmarks group
                                 if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux) && (job.MemoryLimitInBytes > 0 || job.CpuLimitRatio > 0 || !String.IsNullOrEmpty(job.CpuSet)))
                                 {
@@ -1145,29 +1275,7 @@ namespace Microsoft.Crank.Agent
                                     await ProcessUtil.RunAsync("cgdelete", $"cpu,memory,cpuset:{controller}", log: true, throwOnError: false);
                                 }
 
-                                // Check if we already passed here
-                                if (context.Timer == null)
-                                {
-                                    return;
-                                }
-
                                 StopCounters();
-
-                                StopMeasurement();
-                                
-                                Monitor.Enter(_synLock);
-
-                                try
-                                {
-                                    context.Disposed = true;
-
-                                    context.Timer?.Dispose();
-                                    context.Timer = null;
-                                }
-                                finally
-                                {
-                                    Monitor.Exit(_synLock);
-                                }
 
                                 if (process != null && !process.HasExited)
                                 {
@@ -1186,7 +1294,7 @@ namespace Microsoft.Crank.Agent
                                             }
                                             else if (OperatingSystem == OperatingSystem.Linux)
                                             {
-                                                await StopPerfcollectAsync(perfCollectProcess);
+                                                await StopPerfcollectAsync(job, perfCollectProcess);
                                             }
                                         }
 
@@ -1316,7 +1424,7 @@ namespace Microsoft.Crank.Agent
                             {
                                 await StopJobAsync(abortCollection: true);
 
-                                if (_cleanup && !job.NoClean && tempDir != null)
+                                if (_cleanup && !job.NoClean && String.IsNullOrEmpty(job.Source.SourceKey) && tempDir != null)
                                 {
                                     TryDeleteDir(tempDir, false);
                                 }
@@ -1343,9 +1451,9 @@ namespace Microsoft.Crank.Agent
                             context.EventPipeTask = eventPipeTask;
                             context.EventPipeTerminated = eventPipeTerminated;
 
-                            context.MeasurementsSessionId = measurementsSessionId;
-                            context.MeasurementsTask = measurementsTask;
-                            context.MeasurementsTerminated = measurementsTerminated;
+                            context.EventPipeSession = eventPipeSession;
+                            context.CountersTask = countersTask;
+                            context.CountersCompletionSource = countersCompletionSource;
 
                             await Task.Delay(1000);
                         }
@@ -1447,7 +1555,7 @@ namespace Microsoft.Crank.Agent
             return process;
         }
 
-        private static async Task StopPerfcollectAsync(Process perfCollectProcess)
+        private static async Task StopPerfcollectAsync(Job job,Process perfCollectProcess)
         {
             if (!RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
             {
@@ -1468,7 +1576,12 @@ namespace Microsoft.Crank.Agent
             Mono.Unix.Native.Syscall.kill(processId, Mono.Unix.Native.Signum.SIGINT);
 
             // Max delay for perfcollect to stop
-            var delay = Task.Delay(PerfCollectTimeout);
+            var collectTimeout = job.CollectTimeout > TimeSpan.Zero
+                ? job.CollectTimeout
+                : CollectTimeout
+                ;
+                
+            var delay = Task.Delay(collectTimeout);
 
             while (!perfCollectProcess.HasExited && !delay.IsCompletedSuccessfully)
             {
@@ -1944,7 +2057,7 @@ namespace Microsoft.Crank.Agent
                 {
                     await ProcessUtil.RunAsync("docker", $"rm --force {containerId}", throwOnError: false);
 
-                    if (job.NoClean)
+                    if (job.NoClean || !String.IsNullOrEmpty(job.Source.SourceKey))
                     {
                         await ProcessUtil.RunAsync("docker", $"rmi --force --no-prune {imageName}", throwOnError: false);
                     }
@@ -1969,70 +2082,107 @@ namespace Microsoft.Crank.Agent
         {
             // Clone
             string benchmarkedDir = null;
+            var reuseFolder = false;
 
-            if (job.Source.SourceCode != null)
+            // Is the path a previously created source folder?
+            if (!String.IsNullOrEmpty(job.Source.SourceKey))
             {
-                benchmarkedDir = "src";
-
-                var src = Path.Combine(path, benchmarkedDir);
-                var published = Path.Combine(src, "published");
-
-                if (String.IsNullOrEmpty(job.Executable))
+                // Check the source options are the same (repos, branch, ...)
+                var optionsPath = Path.Combine(path, "options.json");
+                
+                if (File.Exists(optionsPath))
                 {
-                    Log.WriteLine($"Extracting files to {src}");
-                    ZipFile.ExtractToDirectory(job.Source.SourceCode.TempFilename, src);
+                    var content = File.ReadAllText(optionsPath);
+                    var options = JsonConvert.DeserializeObject<Source>(content);
+
+                    if (options.Project != job.Source.Project
+                    || options.Repository != job.Source.Repository
+                    || options.BranchOrCommit != job.Source.BranchOrCommit)
+                    {
+                        Log.WriteLine("[INFO] Ignoring existing source folder as it's not matching the request source settings");
+                        reuseFolder = false;
+                    }
+                    else
+                    {
+                        reuseFolder = true;
+
+                        // benchmarkedDir can be "src" or a local git clone folder
+                        benchmarkedDir = new DirectoryInfo(Directory.GetDirectories(path).FirstOrDefault(x => !x.EndsWith("buildtools"))).Name;
+                    }
                 }
                 else
                 {
-                    Log.WriteLine($"Extracting files to {published}");
-                    ZipFile.ExtractToDirectory(job.Source.SourceCode.TempFilename, published);
+                    // First time using this folder
+                    File.WriteAllText(optionsPath, JsonConvert.SerializeObject(job.Source));
+                    reuseFolder = false;
                 }
-
-                File.Delete(job.Source.SourceCode.TempFilename);
             }
-            else
+
+            if (!reuseFolder)
             {
-                // It's possible that the user specified a custom branch/commit for the benchmarks repo,
-                // so we need to add that to the set of sources to restore if it's not already there.
-                //
-                // Note that this is also going to de-dupe the repos if the same one was specified twice at
-                // the command-line (last first to support overrides).
-                var repositories = new HashSet<Source>(SourceRepoComparer.Instance);
-
-                repositories.Add(job.Source);
-
-                foreach (var source in repositories)
+                if (job.Source.SourceCode != null)
                 {
-                    if (cancellationToken.IsCancellationRequested)
+                    benchmarkedDir = "src";
+
+                    var src = Path.Combine(path, benchmarkedDir);
+                    var published = Path.Combine(src, "published");
+
+                    if (String.IsNullOrEmpty(job.Executable))
                     {
-                        return null;
+                        Log.WriteLine($"Extracting files to {src}");
+                        ZipFile.ExtractToDirectory(job.Source.SourceCode.TempFilename, src);
+                    }
+                    else
+                    {
+                        Log.WriteLine($"Extracting files to {published}");
+                        ZipFile.ExtractToDirectory(job.Source.SourceCode.TempFilename, published);
                     }
 
-                    var branchAndCommit = source.BranchOrCommit.Split('#', 2);
+                    File.Delete(job.Source.SourceCode.TempFilename);
+                }
+                else
+                {
+                    // It's possible that the user specified a custom branch/commit for the benchmarks repo,
+                    // so we need to add that to the set of sources to restore if it's not already there.
+                    //
+                    // Note that this is also going to de-dupe the repos if the same one was specified twice at
+                    // the command-line (last first to support overrides).
+                    var repositories = new HashSet<Source>(SourceRepoComparer.Instance);
 
-                    var dir = await Git.CloneAsync(path, source.Repository, shallow: branchAndCommit.Length == 1, branch: branchAndCommit[0], cancellationToken);
+                    repositories.Add(job.Source);
 
-                    var srcDir = Path.Combine(path, dir);
-
-                    if (SourceRepoComparer.Instance.Equals(source, job.Source))
+                    foreach (var source in repositories)
                     {
-                        benchmarkedDir = dir;
-                    }
+                        if (cancellationToken.IsCancellationRequested)
+                        {
+                            return null;
+                        }
 
-                    if (branchAndCommit.Length > 1)
-                    {
-                        await Git.CheckoutAsync(srcDir, branchAndCommit[1], cancellationToken);
-                    }
+                        var branchAndCommit = source.BranchOrCommit.Split('#', 2);
 
-                    if (source.InitSubmodules)
-                    {
-                        await Git.InitSubModulesAsync(srcDir, cancellationToken);
+                        var dir = await Git.CloneAsync(path, source.Repository, shallow: branchAndCommit.Length == 1, branch: branchAndCommit[0], cancellationToken);
+
+                        var srcDir = Path.Combine(path, dir);
+
+                        if (SourceRepoComparer.Instance.Equals(source, job.Source))
+                        {
+                            benchmarkedDir = dir;
+                        }
+
+                        if (branchAndCommit.Length > 1)
+                        {
+                            await Git.CheckoutAsync(srcDir, branchAndCommit[1], cancellationToken);
+                        }
+
+                        if (source.InitSubmodules)
+                        {
+                            await Git.InitSubModulesAsync(srcDir, cancellationToken);
+                        }
                     }
                 }
             }
 
             Debug.Assert(benchmarkedDir != null);
-
 
             // Computes the location of the benchmarked app
             var benchmarkedApp = Path.Combine(path, benchmarkedDir);
@@ -2044,14 +2194,24 @@ namespace Microsoft.Crank.Agent
 
             Log.WriteLine($"Benchmarked Application in {benchmarkedApp}");
 
+            // Skip installing dotnet or building project if not necessary
             var requireDotnetBuild =
                 !String.IsNullOrEmpty(job.Source.Project) ||
                 String.Equals("dotnet", job.Executable, StringComparison.OrdinalIgnoreCase)
-                ;
+            ;
 
-            // Skip installing dotnet or building project if not necessary
             if (!requireDotnetBuild)
             {
+                Log.WriteLine("Skipping build step, no required");
+                return benchmarkedDir;
+            }
+
+            // Skip installing dotnet or building project if already built and build is not requested
+            requireDotnetBuild = !reuseFolder || !job.Source.NoBuild;
+
+            if (!requireDotnetBuild)
+            {
+                Log.WriteLine("Skipping build step, reusing previous build");
                 return benchmarkedDir;
             }
 
@@ -2199,8 +2359,9 @@ namespace Microsoft.Crank.Agent
 
                         if (!beforeDesktop.Contains(targetFramework))
                         {
-                            if (!_installedDesktopRuntimes.Contains(desktopVersion) &&
-                                !_ignoredDesktopRuntimes.Contains(desktopVersion))
+                            if (!String.IsNullOrEmpty(desktopVersion) 
+                                && !_installedDesktopRuntimes.Contains(desktopVersion) 
+                                && !_ignoredDesktopRuntimes.Contains(desktopVersion))
                             {
                                 dotnetInstallStep = $"Desktop runtime '{desktopVersion}'";
                                 Log.WriteLine($"Installing {dotnetInstallStep} ...");
@@ -2428,7 +2589,7 @@ namespace Microsoft.Crank.Agent
 
                 if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                 {
-                    if (job.Hardware == Hardware.ARM64)
+                    if (RuntimeInformation.ProcessArchitecture == Architecture.Arm64)
                     {
                         buildParameters += "-r win-arm64 ";
                     }
@@ -2443,7 +2604,7 @@ namespace Microsoft.Crank.Agent
                 }
                 else
                 {
-                    if (job.Hardware == Hardware.ARM64)
+                    if (RuntimeInformation.ProcessArchitecture == Architecture.Arm64)
                     {
                         buildParameters += "-r linux-arm64 ";
                     }
@@ -2635,7 +2796,7 @@ namespace Microsoft.Crank.Agent
                     throw new Exception("The job is trying to use the mono runtime but was not configured as self-contained.");
                 }
 
-                await UseMonoRuntimeAsync(runtimeVersion, outputFolder, job.UseMonoRuntime, job.Hardware);
+                await UseMonoRuntimeAsync(runtimeVersion, outputFolder, job.UseMonoRuntime);
             }
 
             // Copy all output attachments
@@ -3051,12 +3212,8 @@ namespace Microsoft.Crank.Agent
             }
             else if (String.Equals(sdkVersion, "Edge", StringComparison.OrdinalIgnoreCase))
             {
-                // hard-coded value until https://github.com/dotnet/sdk/issues/14660 is fixed
-                sdkVersion = "6.0.100-alpha.1.20568.5";
-                Log.WriteLine($"SDK: {sdkVersion} (Edge - hard-coded)");
-
-                // sdkVersion = await ParseLatestVersionFile(_latestSdkVersionUrl);
-                // Log.WriteLine($"SDK: {sdkVersion} (Edge)");
+                sdkVersion = await ParseLatestVersionFile(_latestSdkVersionUrl);
+                Log.WriteLine($"SDK: {sdkVersion} (Edge)");
             }
             else
             {
@@ -3564,6 +3721,8 @@ namespace Microsoft.Crank.Agent
                 EnableRaisingEvents = true
             };
 
+            process.StartInfo.Environment.Add("DOTNET_EXE", GetDotNetExecutable(dotnetHome));
+
             process.StartInfo.Environment.Add("COREHOST_SERVER_GC", "1");
 
             // Force Kestrel server urls
@@ -3607,9 +3766,9 @@ namespace Microsoft.Crank.Agent
 
                     job.Output.AddLine(e.Data);
 
-                    if (job.State == JobState.Starting &&
-                        ((!String.IsNullOrEmpty(job.ReadyStateText) && e.Data.IndexOf(job.ReadyStateText, StringComparison.OrdinalIgnoreCase) >= 0) || job.IsConsoleApp))
+                    if (job.State == JobState.Starting && !String.IsNullOrEmpty(job.ReadyStateText) && e.Data.IndexOf(job.ReadyStateText, StringComparison.OrdinalIgnoreCase) >= 0)
                     {
+                        Log.WriteLine($"Ready state detected, application is now running...");
                         RunAndTrace();
                     }
 
@@ -3627,23 +3786,10 @@ namespace Microsoft.Crank.Agent
 
                     job.Output.AddLine(log);
 
-                    if (job.State == JobState.Starting &&
-                        ((!String.IsNullOrEmpty(job.ReadyStateText) && e.Data.IndexOf(job.ReadyStateText, StringComparison.OrdinalIgnoreCase) >= 0) || job.IsConsoleApp))
+                    if (job.State == JobState.Starting && !String.IsNullOrEmpty(job.ReadyStateText) && e.Data.IndexOf(job.ReadyStateText, StringComparison.OrdinalIgnoreCase) >= 0)
                     {
-                        MarkAsRunning(hostname, job, stopwatch);
-
-                        if (!job.CollectStartup)
-                        {
-                            if (job.Collect)
-                            {
-                                StartCollection(Path.Combine(benchmarksRepo, job.BasePath), job);
-                            }
-
-                            if (job.DotNetTrace)
-                            {
-                                StartDotNetTrace(process.Id, job);
-                            }
-                        }
+                        Log.WriteLine($"Ready state detected, application is now running...");
+                        RunAndTrace();
                     }
 
                     // Detect the app is wrapping a child process
@@ -3684,12 +3830,8 @@ namespace Microsoft.Crank.Agent
                 RunAndTrace();
             }
 
-            if (job.Counters.Any())
-            {
-                StartCounters(job);
-            }
-
-            StartMeasurement(job);
+            // Don't wait for the counters to be ready as it could get stuck and block the agent
+            var _ = StartCountersAsync(job);
 
             if (job.MemoryLimitInBytes > 0)
             {
@@ -3745,65 +3887,116 @@ namespace Microsoft.Crank.Agent
             return $"benchmarks-{Process.GetCurrentProcess().Id}-{job.Id}";
         }
 
-        private static void StartCounters(Job job)
+        private static async Task StartCountersAsync(Job job)
         {
-            eventPipeTerminated = false;
-            eventPipeTask = new Task(async () =>
+            if (job.ProcessId == 0)
             {
-                var providerNames = job.Counters.Select(x => x.Provider).Distinct().ToArray();
+                throw new ArgumentException($"Undefined process id for '{job.Service}'");
+            }
 
-                Log.WriteLine($"Listening to counter event pipes (providers: {string.Join(", ", providerNames)})");
+            Log.WriteLine("Starting counters");
 
+            var client = new DiagnosticsClient(job.ProcessId);
+
+            var providerNames = job.Counters.Select(x => x.Provider).Distinct().ToArray();
+
+            var providerList = providerNames
+                .Select(p => new EventPipeProvider(
+                    name: p,
+                    eventLevel: EventLevel.Informational,
+                    arguments: new Dictionary<string, string>() 
+                        { { "EventCounterIntervalSec", "1" } })
+                )
+                .ToList();
+
+            providerList.Add(
+                new EventPipeProvider(
+                    name: "Benchmarks",
+                    eventLevel: EventLevel.Verbose)
+            );
+
+            eventPipeSession = null;
+
+            var retries = 0;
+            while (retries <= 10)
+            {
                 try
                 {
-                    var providerList = providerNames
-                        .Select(p => new EventPipeProvider(
-                            name: p,
-                            eventLevel: EventLevel.Informational,
-                            arguments: new Dictionary<string, string>() 
-                                { { "EventCounterIntervalSec", "1" } })
-                        )
-                        .ToList();
+                    Log.WriteLine("Starting event pipe session");
+                    eventPipeSession = client.StartEventPipeSession(providerList);
+                    break;
+                }
+                catch (ServerNotAvailableException)
+                {
+                    Log.WriteLine("IPC endpoint not available, retrying...");
+                    await Task.Delay(100);
+                }
+                catch (EndOfStreamException)
+                {
+                    Log.WriteLine($"[ERROR] Application stopped before an event pipe session could be created ({job.Service})");
+                    await Task.Delay(100);
+                }
+                catch (Exception e)
+                {
+                    Log.WriteLine("[ERROR] DiagnosticsClient.StartEventPipeSession() -> " + e.ToString());
+                    await Task.Delay(100);
+                }
 
-                    var configuration = new EventPipeSessionConfiguration(
-                            circularBufferSizeMB: 1000,
-                            format: EventPipeSerializationFormat.NetTrace,
-                            providers: providerList);
+                retries++;
+            }
 
-                    EventPipeEventSource source = null;
-                    Stream binaryReader = null;
+            if (retries >= 10)
+            {
+                Log.WriteLine("[ERROR] Failed to create event pipe client after 10 attempts");
+                return;
+            }
 
-                    var retries = 10;
-                    while (retries-- > 0)
+            countersCompletionSource = new TaskCompletionSource<bool>();
+
+            Log.WriteLine("Event pipe session started");
+
+            // Run asynchronously so it doesn't block the agent
+            var streamTask = Task.Run(() =>
+            {
+                var source = new EventPipeEventSource(eventPipeSession.EventStream);
+
+                Log.WriteLine("Event pipe source created");
+
+                source.Dynamic.All += (TraceEvent eventData) => 
+                {
+                    // We only track event counters for System.Runtime
+                    if (eventData.ProviderName == "Benchmarks")
                     {
-                        try
-                        {
-                            binaryReader = EventPipeClient.CollectTracing(job.ProcessId, configuration, out eventPipeSessionId);
-                            break;
-                        }
-                        catch (TimeoutException)
-                        {
-                        }
+                        // TODO: Catch all event counters automatically
+                        // And configure the filterData in the provider
 
-                        await Task.Delay(100);
+                        if (eventData.EventName.StartsWith("Measure"))
+                        {
+                            job.Measurements.Enqueue(new Measurement
+                            {
+                                Timestamp = eventData.TimeStamp,
+                                Name = eventData.PayloadByName("name").ToString(),
+                                Value = eventData.PayloadByName("value")
+                            });
+                        }
+                        else if (eventData.EventName == "Metadata")
+                        {
+                            job.Metadata.Enqueue(new MeasurementMetadata
+                            {
+                                Source = "Benchmark",
+                                Name = eventData.PayloadByName("name").ToString(),
+                                Aggregate = Enum.Parse<Operation>(eventData.PayloadByName("aggregate").ToString(), true),
+                                Reduce = Enum.Parse<Operation>(eventData.PayloadByName("reduce").ToString(), true),
+                                ShortDescription = eventData.PayloadByName("shortDescription").ToString(),
+                                LongDescription = eventData.PayloadByName("longDescription").ToString(),
+                                Format = eventData.PayloadByName("format").ToString(),
+                            });
+                        }
                     }
 
-                    if (retries == -1)
+                    // We only track event counters
+                    if (eventData.EventName.Equals("EventCounters"))
                     {
-                        Log.WriteLine("[ERROR] Failed to create counters event pipe client");
-                        return;
-                    }
-
-                    source = new EventPipeEventSource(binaryReader);
-
-                    source.Dynamic.All += (eventData) =>
-                    {
-                        // We only track event counters
-                        if (!eventData.EventName.Equals("EventCounters"))
-                        {
-                            return;
-                        }
-
                         var payloadVal = (IDictionary<string, object>)(eventData.PayloadValue(0));
                         var payloadFields = (IDictionary<string, object>)(payloadVal["Payload"]);
 
@@ -3844,146 +4037,49 @@ namespace Microsoft.Crank.Agent
                         measurement.Timestamp = eventData.TimeStamp;
 
                         job.Measurements.Enqueue(measurement);
-                    };
-
-                    source.Process();
-                }
-                catch (Exception ex)
-                {
-                    if (ex.Message == "Read past end of stream.")
-                    {
-                        // Expected if the process has exited by itself
-                        // and the event pipe is till trying to read from it
                     }
-                    else
-                    {
-                        Log.WriteLine($"[ERROR] {ex.ToString()}");
-                    }
-                }
-                finally
-                {
-                    eventPipeTerminated = true; // This indicates that the runtime is done. We shouldn't try to talk to it anymore.
-                }
-            });
-
-            eventPipeTask.Start();
-        }
-
-        private static void StartMeasurement(Job job)
-        {
-            if (job.ProcessId == 0)
-            {
-                throw new ArgumentException($"Undefined process id for '{job.Service}'");
-            }
-
-            measurementsTerminated = false;
-            measurementsTask = new Task(async () =>
-            {
-                Log.WriteLine("Starting measurement");
+                };
 
                 try
                 {
-                    var providerList = new List<EventPipeProvider>()
-                        {
-                            new EventPipeProvider(
-                                name: "Benchmarks",
-                                eventLevel: EventLevel.Verbose),
-                        };
-
-                    var configuration = new EventPipeSessionConfiguration(
-                            circularBufferSizeMB: 1000,
-                            format: EventPipeSerializationFormat.NetTrace,
-                            providers: providerList);
-
-                    EventPipeEventSource source = null;
-                    Stream binaryReader = null;
-
-                    var retries = 10;
-                    while (retries-- > 0)
-                    {
-                        try
-                        {
-                            binaryReader = EventPipeClient.CollectTracing(job.ProcessId, configuration, out measurementsSessionId);
-                            break;
-                        }
-                        catch (TimeoutException)
-                        {
-                        }
-
-                        await Task.Delay(100);
-                    }
-
-                    if (retries == -1)
-                    {
-                        Log.WriteLine("[ERROR] Failed to create measurements event pipe client");
-                        return;
-                    }
-
-                    source = new EventPipeEventSource(binaryReader);
-
-                    source.Dynamic.All += (eventData) =>
-                    {
-                        // We only track event counters for System.Runtime
-                        if (eventData.ProviderName == "Benchmarks")
-                        {
-                            // TODO: Catch all event counters automatically
-                            // And configure the filterData in the provider
-                            //if (!eventData.EventName.Equals("EventCounters"))
-                            //{
-                            //job.Measurements.Enqueue(new Measurement
-                            //{
-                            //    Timestamp = eventData.TimeStamp,
-                            //    Name = eventData.PayloadByName("name").ToString(),
-                            //    Value = eventData.PayloadByName("value")
-                            //});
-                            //}
-
-                            if (eventData.EventName.StartsWith("Measure"))
-                            {
-                                job.Measurements.Enqueue(new Measurement
-                                {
-                                    Timestamp = eventData.TimeStamp,
-                                    Name = eventData.PayloadByName("name").ToString(),
-                                    Value = eventData.PayloadByName("value")
-                                });
-                            }
-                            else if (eventData.EventName == "Metadata")
-                            {
-                                job.Metadata.Enqueue(new MeasurementMetadata
-                                {
-                                    Source = "Benchmark",
-                                    Name = eventData.PayloadByName("name").ToString(),
-                                    Aggregate = Enum.Parse<Operation>(eventData.PayloadByName("aggregate").ToString(), true),
-                                    Reduce = Enum.Parse<Operation>(eventData.PayloadByName("reduce").ToString(), true),
-                                    ShortDescription = eventData.PayloadByName("shortDescription").ToString(),
-                                    LongDescription = eventData.PayloadByName("longDescription").ToString(),
-                                    Format = eventData.PayloadByName("format").ToString(),
-                                });
-                            }
-                        }
-                    };
-
+                    Log.WriteLine($"Processing event pipe source ({job.Service})...");
                     source.Process();
+                    Log.WriteLine($"Event pipe source stopped ({job.Service})");
                 }
-                catch (Exception ex)
+                catch (Exception e)
                 {
-                    if (ex.Message == "Read past end of stream.")
+                    if (e.Message == "Read past end of stream.")
                     {
                         // Expected if the process has exited by itself
                         // and the event pipe is till trying to read from it
                     }
                     else
                     {
-                        Log.WriteLine($"[ERROR] {ex.ToString()}");
+                        Log.WriteLine($"[ERROR] source.Process() -> {e.ToString()}");
                     }
-                }
-                finally
-                {
-                    measurementsTerminated = true; // This indicates that the runtime is done. We shouldn't try to talk to it anymore.
                 }
             });
 
-            measurementsTask.Start();
+            var stopTask = Task.Run(async () =>
+            {
+                await Task.WhenAny(streamTask, countersCompletionSource.Task);
+
+                Log.WriteLine($"Stopping event pipe session ({job.Service})...");
+
+                // It also interrupts the source.Process() blocking operation
+                eventPipeSession.Stop();
+                Log.WriteLine($"Event pipe session stopped ({job.Service})");
+            });
+
+            countersTask = Task.WhenAll(streamTask, stopTask);
+            
+            await countersTask;
+
+            // The event pipe session needs to be disposed after the source is interrupted
+            eventPipeSession.Dispose();
+            eventPipeSession = null;
+
+            Log.WriteLine($"Event pipes terminated ({job.Service})");
         }
 
         private static void StartCollection(string workingDirectory, Job job)
@@ -4044,30 +4140,20 @@ namespace Microsoft.Crank.Agent
             job.PerfViewTraceFile = Path.Combine(job.BasePath, "trace.nettrace");
 
             dotnetTraceManualReset = new ManualResetEvent(false);
-            dotnetTraceTask = Collect(dotnetTraceManualReset, processId, new FileInfo(job.PerfViewTraceFile), 256, job.DotNetTraceProviders, default(TimeSpan));
-
-            if (dotnetTraceTask == null)
-            {
-                throw new Exception("NULL!!!");
-            }
+            dotnetTraceTask = Collect(dotnetTraceManualReset, processId, new FileInfo(job.PerfViewTraceFile), 256, job.DotNetTraceProviders, TimeSpan.MaxValue);
         }
 
-        private static async Task UseMonoRuntimeAsync(string runtimeVersion, string outputFolder, string mode, Hardware? hardware)
+        private static async Task UseMonoRuntimeAsync(string runtimeVersion, string outputFolder, string mode)
         {
             if (String.IsNullOrEmpty(mode))
             {
                 return;
             }
 
-            string pkgNameSuffix = "";
-            if (hardware == Hardware.ARM64)
-            {
-                pkgNameSuffix = "arm64";
-            }
-            else
-            {
-                pkgNameSuffix = "x64";
-            }
+            var pkgNameSuffix = RuntimeInformation.ProcessArchitecture == Architecture.Arm64
+                ? "arm64"
+                : "x64"
+                ;
 
             try
             {
@@ -4139,13 +4225,18 @@ namespace Microsoft.Crank.Agent
 
         private static async Task AOT4Mono(string dotnetSdkVersion, string runtimeVersion, string outputFolder)
         {
+            var pkgNameSuffix = RuntimeInformation.ProcessArchitecture == Architecture.Arm64
+                ? "arm64"
+                : "x64"
+                ;
+
             try
             {
                 var fileName = "/bin/bash";
 
                 //Download dotnet sdk package
-                var dotnetMonoPath = Path.Combine(_rootTempDir, "dotnet-mono", $"dotnet-sdk-{dotnetSdkVersion}-linux-x64.tar.gz");
-                var packageName = "Microsoft.NETCore.App.Runtime.Mono.LLVM.AOT.linux-x64".ToLowerInvariant();
+                var dotnetMonoPath = Path.Combine(_rootTempDir, "dotnet-mono", $"dotnet-sdk-{dotnetSdkVersion}-linux-{pkgNameSuffix}.tar.gz");
+                var packageName = $"Microsoft.NETCore.App.Runtime.Mono.LLVM.AOT.linux-{pkgNameSuffix}".ToLowerInvariant();
                 var runtimePath = Path.Combine(_rootTempDir, "RuntimePackages", $"{packageName}.{runtimeVersion}.nupkg");
                 var llvmExtractDir = Path.Combine(Path.GetDirectoryName(runtimePath), "mono-llvm");
 		
@@ -4156,7 +4247,7 @@ namespace Microsoft.Crank.Agent
                     Log.WriteLine($"Downloading dotnet skd package for mono AOT");
 
                     var found = false;
-                    var url = $"https://dotnetcli.azureedge.net/dotnet/Sdk/{dotnetSdkVersion}/dotnet-sdk-{dotnetSdkVersion}-linux-x64.tar.gz";
+                    var url = $"https://dotnetcli.azureedge.net/dotnet/Sdk/{dotnetSdkVersion}/dotnet-sdk-{dotnetSdkVersion}-linux-{pkgNameSuffix}.tar.gz";
 
                     if (await DownloadFileAsync(url, dotnetMonoPath, maxRetries: 3, timeout: 60, throwOnError: false))
                     {
@@ -4169,7 +4260,7 @@ namespace Microsoft.Crank.Agent
                     }
                     else
                     {
-                        var strCmdTar = $"tar -xf dotnet-sdk-{dotnetSdkVersion}-linux-x64.tar.gz";
+                        var strCmdTar = $"tar -xf dotnet-sdk-{dotnetSdkVersion}-linux-{pkgNameSuffix}.tar.gz";
                         var resultTar = await ProcessUtil.RunAsync(fileName, 
                             ConvertCmd2Arg(strCmdTar),
                             workingDirectory: Path.GetDirectoryName(dotnetMonoPath),
@@ -4187,10 +4278,10 @@ namespace Microsoft.Crank.Agent
 
                     using (var archive = ZipFile.OpenRead(runtimePath))
                     {
-                        var llcExe = archive.GetEntry("runtimes/linux-x64/native/llc");
+                        var llcExe = archive.GetEntry($"runtimes/linux-{pkgNameSuffix}/native/llc");
                         llcExe.ExtractToFile(Path.Combine(llvmExtractDir, "llc"), true);
 
-                        var optExe = archive.GetEntry("runtimes/linux-x64/native/opt");
+                        var optExe = archive.GetEntry($"runtimes/linux-{pkgNameSuffix}/native/opt");
                         optExe.ExtractToFile(Path.Combine(llvmExtractDir, "opt"), true);
                     }
                     
@@ -4263,6 +4354,7 @@ namespace Microsoft.Crank.Agent
             job.Url = ComputeServerUrl(hostname, job);
 
             // Mark the job as running to allow the Client to start the test
+            Log.WriteLine($"{job.State} -> Running");
             job.State = JobState.Running;
 
             return true;
@@ -4282,7 +4374,7 @@ namespace Microsoft.Crank.Agent
                 element.SetAttributeValue(name, value);
             }
 
-            using (var resourceStream = Assembly.GetCallingAssembly().GetManifestResourceStream("BenchmarksServer.applicationHost.config"))
+            using (var resourceStream = Assembly.GetCallingAssembly().GetManifestResourceStream("Microsoft.Crank.Agent.applicationHost.config"))
             {
                 var applicationHostConfig = XDocument.Load(resourceStream);
                 SetAttribute(applicationHostConfig, "/configuration/system.webServer/aspNetCore", "processPath", executable);
@@ -4584,88 +4676,45 @@ namespace Microsoft.Crank.Agent
                 }
             }
 
-            var process = Process.GetProcessById(processId);
-            var configuration = new EventPipeSessionConfiguration(
-                circularBufferSizeMB: buffersize,
-                format: EventPipeSerializationFormat.NetTrace,
-                providers: providerCollection.ToList().AsReadOnly());
-
-            var shouldStopAfterDuration = duration != default(TimeSpan);
             var failed = false;
-            var terminated = false;
-            System.Timers.Timer durationTimer = null;
 
-            Log.WriteLine($"Tracing process {processId} on file {output.FullName}");
+            var client = new DiagnosticsClient(processId);
+            EventPipeSession traceSession = client.StartEventPipeSession(providerCollection, circularBufferMB: buffersize);
 
-            ulong sessionId = 0;
-            using (Stream stream = EventPipeClient.CollectTracing(processId, configuration, out sessionId))
+            var collectingTask = new Task(async () => 
             {
-                if (sessionId == 0)
+                try
                 {
-                    return -1;
-                }
-
-                if (shouldStopAfterDuration)
-                {
-                    durationTimer = new System.Timers.Timer(duration.TotalMilliseconds);
-                    durationTimer.Elapsed += (s, e) => shouldExit.Set();
-                    durationTimer.AutoReset = false;
-                }
-
-                var collectingTask = new Task(() =>
-                {
-                    try
+                    using (FileStream fs = new FileStream(output.FullName, FileMode.Create, FileAccess.Write))
                     {
-                        var stopwatch = new Stopwatch();
-                        durationTimer?.Start();
-                        stopwatch.Start();
-
-                        using (var fs = new FileStream(output.FullName, FileMode.Create, FileAccess.Write))
-                        {
-                            var buffer = new byte[16 * 1024];
-
-                            while (true)
-                            {
-                                int nBytesRead = stream.Read(buffer, 0, buffer.Length);
-                                if (nBytesRead <= 0)
-                                    break;
-                                fs.Write(buffer, 0, nBytesRead);
-                            }
-                        }
+                        await traceSession.EventStream.CopyToAsync(fs);
                     }
-                    catch (Exception ex)
-                    {
-                        Log.WriteLine($"Tracing failed with exception {ex}");
 
-                        failed = true;
-                    }
-                    finally
-                    {
-                        terminated = true;
-                        shouldExit.Set();
-
-                        Log.WriteLine($"Tracing terminated.");
-                    }
-                });
-                collectingTask.Start();
-
-                do
-                {
-                    await Task.Delay(100);
-                } while (!shouldExit.WaitOne(0));
-
-                Log.WriteLine($"Tracing stopped");
-
-                if (!terminated)
-                {
-                    durationTimer?.Stop();
-                    EventPipeClient.StopTracing(processId, sessionId);
+                    Log.WriteLine($"Tracing session ended.");
                 }
+                catch (Exception ex)
+                {
+                    Log.WriteLine($"Tracing failed with exception {ex}");
+                    failed = true;
+                }
+                finally
+                {
+                    shouldExit.Set();
+                }
+            });
 
-                await collectingTask;
+            collectingTask.Start();
+
+            var durationTask = Task.Delay(duration);
+
+            while (!shouldExit.WaitOne(0) && !durationTask.IsCompleted)
+            {
+                await Task.Delay(100);
             }
 
-            durationTimer?.Dispose();
+            traceSession.Dispose();
+
+            Log.WriteLine($"Tracing finalized");
 
             return failed ? -1 : 0;
         }
@@ -4698,6 +4747,8 @@ namespace Microsoft.Crank.Agent
             Log.WriteLine($"Checking requirements...");
 
             // Add a NuGet.config for the self-contained deployments to be able to find the runtime packages on the CI feeds
+            // This is not taken into account however if the source folder contains its own witha <clear /> statement as this one
+            // is defined in the root benchmarks agent folder.
 
             var rootNugetConfig = Path.Combine(_rootTempDir, "NuGet.Config");
 

@@ -24,6 +24,7 @@ using System.Text;
 using Manatee.Json.Schema;
 using Manatee.Json;
 using Jint;
+using System.Security.Cryptography;
 
 namespace Microsoft.Crank.Controller
 {
@@ -417,7 +418,6 @@ namespace Microsoft.Crank.Controller
                         session,
                         iterations,
                         exclude,
-                        span,
                         _scriptOption.Values
                         );
                 }
@@ -464,7 +464,6 @@ namespace Microsoft.Crank.Controller
             string session,
             int iterations,
             int exclude,
-            TimeSpan span,
             IEnumerable<string> scripts
             )
         {
@@ -476,8 +475,6 @@ namespace Microsoft.Crank.Controller
 
             do
             {
-                // Repeat until the span duration is over
-
                 var executionResult = new ExecutionResult();
 
                 if (iterations > 1)
@@ -525,7 +522,7 @@ namespace Microsoft.Crank.Controller
                                 if (!await EnsureServerRequirementsAsync(jobs, service))
                                 {
                                     Log.Write($"Scenario skipped as the agent doesn't match the operating and architecture constraints for '{jobName}' ({String.Join("/", new[] { service.Options.RequiredArchitecture, service.Options.RequiredOperatingSystem })})");
-                                    return new ExecutionResult();
+                                    return new ExecutionResult { ReturnCode = 0 };
                                 }
 
                                 // Check that we are not creating a deadlock by starting this job
@@ -597,7 +594,6 @@ namespace Microsoft.Crank.Controller
                                                                     break;
                                                                 }
                                                             } 
-                                                            
 
                                                             throw new JobDeadlockException();
                                                         }
@@ -648,6 +644,9 @@ namespace Microsoft.Crank.Controller
                                         if (!String.IsNullOrEmpty(job.Job.Error))
                                         {
                                             Log.Write(job.Job.Error, notime: true, error: true);
+
+                                            // It might be necessary to get the formal exit code from the remove job
+                                            executionResult.ReturnCode = 1;
                                         }
                                     }
 
@@ -676,6 +675,7 @@ namespace Microsoft.Crank.Controller
                             if (aJobFailed)
                             {
                                 Log.Write($"Job has failed, interrupting benchmarks ...");
+                                executionResult.ReturnCode = 1;
                                 break;
                             }
                         }
@@ -754,10 +754,12 @@ namespace Microsoft.Crank.Controller
                         continue;
                     }
 
-                    var job = jobResults.Jobs[jobName];
-
-                    Console.WriteLine();
-                    WriteResults(jobName, job);
+                    // The subsequent jobs of a failed job might not have run
+                    if (jobResults.Jobs.TryGetValue(jobName, out var job))
+                    {
+                        Console.WriteLine();
+                        WriteResults(jobName, job);
+                    }
                 }
 
                 foreach (var property in _propertyOption.Values)
@@ -800,20 +802,8 @@ namespace Microsoft.Crank.Controller
                         Directory.CreateDirectory(directory);
                     }
 
-                    var index = 1;
-                    
-                    // If running in a span, create a unique filename for each run
-                    if (span > TimeSpan.Zero)
-                    {
-                        do
-                        {
-                            var filenameWithoutExtension = Path.GetFileNameWithoutExtension(_outputOption.Value());
-                            filename = filenameWithoutExtension + "-" + index++ + Path.GetExtension(_outputOption.Value());
-                        } while (File.Exists(filename));
-                    }
-                    
                     // Skip saving the file if running with iterations and not the last run
-                    if (i == iterations || span > TimeSpan.Zero)
+                    if (i == iterations)
                     {
                         await File.WriteAllTextAsync(filename, JsonConvert.SerializeObject(executionResults.First(), Formatting.Indented, new JsonSerializerSettings { ContractResolver = new CamelCasePropertyNamesContractResolver() }));
 
@@ -827,15 +817,10 @@ namespace Microsoft.Crank.Controller
                 if (!String.IsNullOrEmpty(_sqlConnectionString))
                 {
                     // Skip storing results if running with iterations and not the last run
-                    if (i == iterations || span > TimeSpan.Zero)
+                    if (i == iterations)
                     {
                         await JobSerializer.WriteJobResultsToSqlAsync(executionResult.JobResults, _sqlConnectionString, _tableName, session, _scenarioOption.Value(), _descriptionOption.Value());
                     }
-                }
-
-                if (span > TimeSpan.Zero)
-                {
-                    Log.Write(String.Format("Remaining job duration: {0}", GetRemainingTime()));
                 }
 
                 i = i + 1;
@@ -844,16 +829,6 @@ namespace Microsoft.Crank.Controller
 
             return executionResults.First();
 
-            TimeSpan GetRemainingTime()
-            {
-                return span - GetElapsedTime();
-            }
-
-            TimeSpan GetElapsedTime()
-            {
-                return DateTime.UtcNow - iterationStart;
-            }
-
             bool IsRepeatOver()
             {
                 if (iterations > 1)
@@ -861,7 +836,7 @@ namespace Microsoft.Crank.Controller
                     return i > iterations; 
                 }
 
-                return span == TimeSpan.Zero || GetElapsedTime() > span;
+                return true;
             }
 
             bool SpanShouldKeepJobRunning(string jobName)
@@ -1024,7 +999,10 @@ namespace Microsoft.Crank.Controller
                 }
             }
 
-            return new ExecutionResult { ReturnCode = 0 } ;
+            return new ExecutionResult
+            {
+                ReturnCode = String.IsNullOrEmpty(job.Job.Error) ? 0 : 1
+            };
         }
 
         private static async Task<ExecutionResult> RunAutoFlush(
@@ -1373,6 +1351,9 @@ namespace Microsoft.Crank.Controller
 
                 var variables = MergeVariables(rootVariables, jobVariables, commandLineVariables);
 
+                // Apply templates on variables first
+                ApplyTemplates(variables, new TemplateContext { Model = variables.DeepClone() });
+
                 ApplyTemplates(job, new TemplateContext { Model = variables });
             }
 
@@ -1392,12 +1373,53 @@ namespace Microsoft.Crank.Controller
             // Jobs post configuration
             foreach (var job in result.Jobs)
             {
+                if (job.Value.OnConfigure != null && job.Value.OnConfigure.Any())
+                {
+                    var engine =  new Engine();
+                    
+                    engine.SetValue("job", job.Value);
+                    engine.SetValue("console", _scriptConsole);
+
+                    foreach(var script in job.Value.OnConfigure)
+                    {
+                        engine.Execute(script);
+                    }                    
+                }
+
                 // If the job is a BenchmarkDotNet application, define default arguments so we can download the results as JSon
                 if (job.Value.Options.BenchmarkDotNet)
                 {
                     job.Value.WaitForExit = true;
                     job.Value.ReadyStateText ??= "BenchmarkRunner: Start";
                     job.Value.Arguments = DefaultBenchmarkDotNetArguments + " " + job.Value.Arguments;
+                }
+
+                if (job.Value.Options.ReuseSource || job.Value.Options.ReuseBuild)
+                {
+                    var source = job.Value.Source;
+
+                    // Compute a custom source key
+                    source.SourceKey = source.Repository
+                        + source.Project
+                        + source.LocalFolder
+                        + source.BranchOrCommit
+                        + source.DockerImageName
+                        + source.DockerFile
+                        + source.InitSubmodules.ToString()
+                        + source.Repository
+                        ;
+
+                    using (var sha1 = SHA1.Create())  
+                    {  
+                        // Assume no collision since it's verified on the server
+                        var bytes = sha1.ComputeHash(Encoding.UTF8.GetBytes(job.Value.Source.SourceKey));
+                        source.SourceKey = String.Concat(bytes.Select(b => b.ToString("x2"))).Substring(0, 8);
+                    }
+
+                    if (job.Value.Options.ReuseBuild)
+                    {
+                        source.NoBuild = true;
+                    }
                 }
 
                 if (job.Value.CollectCounters)
@@ -1592,6 +1614,10 @@ namespace Microsoft.Crank.Controller
                 {
                     var mergeOptions = new JsonMergeSettings { MergeArrayHandling = MergeArrayHandling.Replace, MergeNullValueHandling = MergeNullValueHandling.Merge };
 
+                    // start from a clear document
+                    var result = new JObject();
+                    
+                    // merge each import
                     foreach (JValue import in (JArray)localconfiguration.GetValue("imports"))
                     {
                         var importFilenameOrUrl = import.ToString();
@@ -1600,9 +1626,13 @@ namespace Microsoft.Crank.Controller
 
                         if (importedConfiguration != null)
                         {
-                            localconfiguration.Merge(importedConfiguration, mergeOptions);
+                            result.Merge(importedConfiguration, mergeOptions);
                         }
                     }
+
+                    // merge local configuration last to win over imports
+                    result.Merge(localconfiguration, mergeOptions);
+                    localconfiguration = result;
                 }
 
                 localconfiguration.Remove("imports");
@@ -1930,9 +1960,9 @@ namespace Microsoft.Crank.Controller
                         {
                             aggregated = engine.Invoke(resultDefinition.Aggregate, arguments: new object [] { measurements[name].Select(x => x.Value).ToArray() }).ToObject();
                         }
-                        catch
+                        catch (Exception ex)
                         {
-                            Console.WriteLine($"Could not aggregate: {name} with {resultDefinition.Aggregate}");
+                            Console.WriteLine($"Could not aggregate: {name} with {resultDefinition.Aggregate} for job {job.Job.Id} error {ex.Message}");
                             continue;
                         }
 
@@ -1974,11 +2004,11 @@ namespace Microsoft.Crank.Controller
 
                 try
                 {
-                    reducedValue = engine.Invoke(resultDefinition.Reduce, arguments: new object [] { values }).ToObject();
+                    reducedValue = engine.Invoke(resultDefinition.Reduce, arguments: new object [] { values.Select(x => x.Value).ToArray() }).ToObject();
                 }
-                catch
+                catch (Exception ex)
                 {
-                    Console.WriteLine($"Could not reduce: {resultDefinition.Name} with {resultDefinition.Reduce}");
+                    Console.WriteLine($"Could not reduce: {resultDefinition.Name} with {resultDefinition.Reduce} error {ex.Message}");
                     continue;
                 }
 
@@ -2310,7 +2340,11 @@ namespace Microsoft.Crank.Controller
         private static ExecutionResult ComputeAverages(IEnumerable<ExecutionResult> executionResults)
         {
             var jobResults = new JobResults();
-            var executionResult = new ExecutionResult { JobResults = jobResults };
+            var executionResult = new ExecutionResult 
+            {
+                ReturnCode = executionResults.Any(x => x.ReturnCode != 0) ? 1 : 0,
+                JobResults = jobResults 
+            };
 
             foreach (var job in executionResults.First().JobResults.Jobs)
             {

@@ -111,6 +111,9 @@ namespace Microsoft.Crank.Controller
 
             while (true)
             {
+                // Once the job is in Initializing (previous loop) we need to download the full state
+                // since the source properties might have been changed to dismiss source upload.
+                
                 Job = await GetJobAsync();
 
                 #region Ensure the job is valid
@@ -142,7 +145,7 @@ namespace Microsoft.Crank.Controller
                         var tempFilename = Path.GetTempFileName();
                         File.Delete(tempFilename);
 
-                        Log.Write($"Using local folder: {Job.Source.LocalFolder}'");
+                        Log.Write($"Using local folder: \"{Job.Source.LocalFolder}\"");
 
                         var sourceDir = Job.Source.LocalFolder;
 
@@ -634,7 +637,7 @@ namespace Microsoft.Crank.Controller
                     traceDestination = traceDestination + "." + DateTime.Now.ToString("MM-dd-HH-mm-ss") + traceExtension;
                 }
 
-                Log.Write($"Collecting trace file '{traceDestination}' ...");
+                Log.Write($"Collecting trace file, this can take several seconds");
 
                 var uri = _serverJobUri + "/trace";
                 var response = await _httpClient.PostAsync(uri, new StringContent(""));
@@ -646,7 +649,7 @@ namespace Microsoft.Crank.Controller
 
                     if (state == JobState.TraceCollecting)
                     {
-                        // Server is collecting the trace
+                        Console.Write(".");
                     }
                     else
                     {
@@ -656,15 +659,17 @@ namespace Microsoft.Crank.Controller
                     await Task.Delay(1000);
                 }
 
-                Log.Write($"Downloading trace file...");
+                Console.WriteLine();
+
+                Log.Write($"Downloading trace file {traceDestination} ...");
 
                 try
                 {
-                    await _httpClient.DownloadFileAsync(uri, _serverJobUri, traceDestination);
+                    await _httpClient.DownloadFileWithProgressAsync(uri, _serverJobUri, traceDestination);
                 }
-                catch
+                catch (Exception e)
                 {
-                    Log.Write($"The trace was not captured on the server");
+                    Log.Write($"The trace was not captured on the server: " + e.ToString());
                 }
             }
             catch (Exception e)
@@ -780,7 +785,7 @@ namespace Microsoft.Crank.Controller
             {
                 var basePath = di.FullName;
 
-                var ignoreFile = IgnoreFile.Parse(Path.Combine(sourceDirectoryName, ".gitignore"));
+                var ignoreFile = IgnoreFile.Parse(Path.Combine(sourceDirectoryName, ".gitignore"), includeParentDirectories: true);
 
                 foreach (var gitFile in ignoreFile.ListDirectory(sourceDirectoryName))
                 {
@@ -793,8 +798,6 @@ namespace Microsoft.Crank.Controller
 
         private static async Task<int> UploadFileAsync(string filename, Job serverJob, string uri)
         {
-            Log.Write($"Uploading {filename}");
-
             try
             {
                 var outputFileSegments = filename.Split(';');
@@ -805,6 +808,8 @@ namespace Microsoft.Crank.Controller
                     Console.WriteLine($"File '{uploadFilename}' could not be loaded.");
                     return 8;
                 }
+
+                Log.Write($"Uploading {filename} ({(new FileInfo(uploadFilename).Length / 1024):n0}KB)");
 
                 var destinationFilename = outputFileSegments.Length > 1
                     ? outputFileSegments[1]

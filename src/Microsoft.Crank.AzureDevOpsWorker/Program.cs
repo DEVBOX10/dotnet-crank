@@ -51,71 +51,99 @@ namespace Microsoft.Crank.AzureDevOpsWorker
         private static async Task ProcessAzureQueue(string connectionString, string queue)
         {
             var client = new ServiceBusClient(connectionString);
+
             var processor = client.CreateProcessor(queue, new ServiceBusProcessorOptions
             {
-                AutoComplete = false,
+                AutoCompleteMessages = false,
                 MaxConcurrentCalls = 1, // Process one message at a time
+                MaxAutoLockRenewalDuration = TimeSpan.FromHours(1) // Maintaing the lock for as much as a job should run 
             });
 
             // Whenever a message is available on the queue
-            processor.ProcessMessageAsync += async args =>
+            processor.ProcessMessageAsync += MessageHandler;
+
+            processor.ProcessErrorAsync += ErrorHandler;
+
+            await processor.StartProcessingAsync();
+
+            Console.WriteLine("Press ENTER to exit...");
+            Console.ReadLine();
+        }
+
+        private static async Task MessageHandler(ProcessMessageEventArgs args)
+        {
+            Console.WriteLine("Processing message '{0}'", args.Message.ToString());
+
+            var message = args.Message;
+
+            JobPayload jobPayload;
+            DevopsMessage devopsMessage = null;
+            Job driverJob = null;
+
+            try
             {
-                Console.WriteLine("Processing message '{0}'", args.Message.ToString());
+                // The DevopsMessage does the communications with AzDo
+                devopsMessage = new DevopsMessage(message);
 
-                var message = args.Message;
+                // The Body contains the parameters for the application to run
+                // We can't use message.Body.FromObjectAsJson since the raw json returned by AzDo is not valid
+                jobPayload = JobPayload.Deserialize(message.Body.ToArray());
 
-                JobPayload jobPayload;
-                DevopsMessage devopsMessage = null;
-                Job driverJob = null;
+                await devopsMessage.SendTaskStartedEventAsync();
+                
+                var arguments = String.Join(' ', jobPayload.Args);
 
-                try
+                Console.WriteLine("Invoking crank with arguments: " + arguments);
+
+                // The DriverJob manages the application's lifetime and standard output
+                driverJob = new Job("crank", arguments);
+
+                driverJob.OnStandardOutput = log => Console.WriteLine(log);
+
+                Console.WriteLine("Processing...");
+
+                driverJob.Start();
+
+                // Pump application standard output while it's running
+                while (driverJob.IsRunning)
                 {
-                    // The DevopsMessage does the communications with AzDo
-                    devopsMessage = new DevopsMessage(message);
-
-                    // The Body contains the parameters for the application to run
-                    jobPayload = JobPayload.Deserialize(message.Body.ToBytes().ToArray());
-
-                    await devopsMessage.SendTaskStartedEventAsync();
-
-                    var arguments = String.Join(' ', jobPayload.Args);
-
-                    Console.WriteLine("Invoking crank with arguments: " + arguments);
-
-                    // The DriverJob manages the application's lifetime and standard output
-                    driverJob = new Job("crank", arguments);
-
-                    driverJob.OnStandardOutput = log => Console.WriteLine(log);
-
-                    Console.WriteLine("Processing...");
-
-                    driverJob.Start();
-
-                    // Pump application standard output while it's running
-                    while (driverJob.IsRunning)
+                    if ((DateTime.UtcNow - driverJob.StartTimeUtc) > jobPayload.Timeout)
                     {
-                        if ((DateTime.UtcNow - driverJob.StartTimeUtc) > jobPayload.Timeout)
-                        {
-                            throw new Exception("Job timed out. The timeout can be increased in the queued message.");
-                        }
-
-                        var logs = driverJob.FlushStandardOutput().ToArray();
-
-                        // Send any page of logs to the AzDo task log feed
-                        if (logs.Any())
-                        {
-                            await devopsMessage.SendTaskLogFeedsAsync(String.Join("\r\n", logs));
-                        }
-
-                        await Task.Delay(TaskLogFeedDelay);
+                        throw new Exception("Job timed out. The timeout can be increased in the queued message.");
                     }
 
-                    // Mark the task as completed
-                    await devopsMessage.SendTaskCompletedEventAsync(succeeded: driverJob.WasSuccessful);
+                    var logs = driverJob.FlushStandardOutput().ToArray();
 
-                    // Create a task log entry
-                    var taskLogObjectString = await devopsMessage?.CreateTaskLogAsync();
+                    // Send any page of logs to the AzDo task log feed
+                    if (logs.Any())
+                    {
+                        var success = await devopsMessage.SendTaskLogFeedsAsync(String.Join("\r\n", logs));
 
+                        if (!success)
+                        {
+                            Console.ForegroundColor = ConsoleColor.DarkYellow;
+                            Console.WriteLine("SendTaskLogFeedsAsync failed. If the task was canceled, this jobs should be ignored stopped.");
+                            Console.ResetColor();
+                        }
+                    }
+
+                    await Task.Delay(TaskLogFeedDelay);
+                }
+
+                // Mark the task as completed
+                await devopsMessage.SendTaskCompletedEventAsync(succeeded: driverJob.WasSuccessful);
+
+                // Create a task log entry
+                var taskLogObjectString = await devopsMessage?.CreateTaskLogAsync();
+
+                if (String.IsNullOrEmpty(taskLogObjectString))
+                {
+                    Console.ForegroundColor = ConsoleColor.DarkYellow;
+                    Console.WriteLine("CreateTaskLogAsync failed. The job is probably canceled.");
+                    Console.ResetColor();
+                }
+                else
+                {
                     var taskLogObject = JsonSerializer.Deserialize<Dictionary<string, object>>(taskLogObjectString);
 
                     var taskLogId = taskLogObject["id"].ToString();
@@ -124,45 +152,51 @@ namespace Microsoft.Crank.AzureDevOpsWorker
 
                     // Attach task log to the timeline record
                     await devopsMessage?.UpdateTaskTimelineRecordAsync(taskLogObjectString);
-
-                    // Mark the message as completed
-                    await args.CompleteMessageAsync(message);
-
-                    driverJob.Stop();
-
-                    Console.WriteLine("Job completed");
                 }
-                catch (Exception e)
-                {
-                    Console.WriteLine("Job failed: " + e.ToString());
 
-                    try
-                    {
-                        await devopsMessage?.SendTaskCompletedEventAsync(succeeded: false);
-                        await args.AbandonMessageAsync(message);
-                    }
-                    catch (Exception f)
-                    {
-                        Console.WriteLine("Failed to abandon task: " + f.ToString());
-                    }
-                }
-                finally
-                {
-                    driverJob?.Dispose();
-                }
-            };
+                // Mark the message as completed
+                await args.CompleteMessageAsync(message);
 
-            processor.ProcessErrorAsync += args =>
+                driverJob.Stop();
+
+                Console.WriteLine("Job completed");
+            }
+            catch (Exception e)
             {
-                Console.WriteLine("Process error: " + args.Exception.ToString());
+                Console.WriteLine("Job failed: " + e.ToString());
 
-                return Task.CompletedTask;
-            };
+                Console.WriteLine("Stopping the task and releasing the message...");
 
-            await processor.StartProcessingAsync();
+                try
+                {
+                    await devopsMessage?.SendTaskCompletedEventAsync(succeeded: false);
+                }
+                catch (Exception f)
+                {
+                    Console.WriteLine("Failed to complete the task: " + f.ToString());
+                }
 
-            Console.WriteLine("Press ENTER to exit...");
-            Console.ReadLine();
+                try
+                {
+                    // TODO: Should the message still be copmleted instead of abandonned?
+                    await args.AbandonMessageAsync(message);
+                }
+                catch (Exception f)
+                {
+                    Console.WriteLine("Failed to abandon the message: " + f.ToString());
+                }
+            }
+            finally
+            {
+                driverJob?.Dispose();
+            }            
+        }
+
+        private static Task ErrorHandler(ProcessErrorEventArgs args)
+        {
+            Console.WriteLine("Process error: " + args.Exception.ToString());
+
+            return Task.CompletedTask;
         }
     }
 }

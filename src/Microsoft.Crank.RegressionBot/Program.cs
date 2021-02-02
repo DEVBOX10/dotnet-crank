@@ -22,6 +22,7 @@ using Newtonsoft.Json.Linq;
 using Octokit;
 using YamlDotNet.Serialization;
 using Microsoft.Crank.RegressionBot.Models;
+using MessagePack;
 
 namespace Microsoft.Crank.RegressionBot
 {
@@ -216,13 +217,38 @@ namespace Microsoft.Crank.RegressionBot
                 
                 Console.WriteLine("Updating existing issues...");
 
+                // The result of updating issues is the list of regressions that are not yet reported
                 var newRegressions = await UpdateIssues(regressions, s, template);
+
+                Console.WriteLine($"{newRegressions.Count()} of them were not reported");
+
+                // Exclude all regressions that have recovered, and have not been reported
+                newRegressions = newRegressions.Where(x => !x.HasRecovered);
+
+                Console.WriteLine($"{newRegressions.Count()} of them have not recovered");
 
                 if (newRegressions.Any())
                 {
                     Console.WriteLine("Reporting new regressions...");
 
-                    await CreateRegressionIssue(newRegressions, template);
+                    if (_options.Verbose)
+                    {
+                        Console.WriteLine(JsonConvert.SerializeObject(newRegressions, Formatting.None));
+                    }
+
+                    var skip = 0;
+                    var pageSize = 10;
+
+                    while (true)
+                    {
+                        // Create issues with 10 regressions per issue max
+                        var page = newRegressions.Skip(skip).Take(pageSize);
+
+                        if (!page.Any()) break;
+
+                        await CreateRegressionIssue(page, template);
+                        skip += pageSize;
+                    }
                 }
                 else
                 {
@@ -271,7 +297,7 @@ namespace Microsoft.Crank.RegressionBot
 
             var body = await CreateIssueBody(regressions, template);            
             
-            var title = "Performance regression: " + String.Join(", ", regressions.Select(x => x.CurrentResult.Scenario).Take(5));
+            var title = "Performance difference: " + String.Join(", ", regressions.Select(x => x.CurrentResult.Scenario).Take(5));
 
             if (regressions.Count() > 5)
             {
@@ -446,7 +472,6 @@ namespace Microsoft.Crank.RegressionBot
             {
                 using (var command = new SqlCommand(String.Format(Queries.Latest, source.Table), connection))
                 {
-                    // Load 14 days or data, to measure 7 days of standard deviation prior to detection
                     command.Parameters.AddWithValue("@startDate", loadStartDateTimeUtc);
                     
                     await connection.OpenAsync();
@@ -513,7 +538,10 @@ namespace Microsoft.Crank.RegressionBot
                 {
                     if (_options.Verbose)
                     {
-                        Console.WriteLine($"Evaluating probe {probe.Path} for {results.Count()} benchmarks");
+                        Console.WriteLine();
+                        Console.WriteLine($"Evaluating probe {descriptor} {probe.Path} with {results.Count()} results");
+                        Console.WriteLine("=============================================================================================");
+                        Console.WriteLine();
                     }
                     
                     var resultSet = results
@@ -547,6 +575,9 @@ namespace Microsoft.Crank.RegressionBot
                     // Look for 2 consecutive values that are outside of the threshold, 
                     // subsequent to 3 consecutive values that are inside the threshold.  
 
+
+                    // 5 is the number of data points necessary to detect a threshold
+
                     for (var i = 0; i < resultSet.Length - 5; i++)
                     {
                         // Skip the measurement if it's too recent
@@ -557,11 +588,11 @@ namespace Microsoft.Crank.RegressionBot
 
                         if (_options.Verbose)
                         {
-                            Console.WriteLine($"Checking {resultSet[i].Value}");
+                            Console.WriteLine($"Checking {resultSet[i + 3].Value} at {resultSet[i + 3].Result.DateTimeUtc} with values {JsonConvert.SerializeObject(values.Skip(i).Take(5).ToArray())}");
                         }
 
-                        // StdevCount measures before current measurement + 2 (to include the first 2 measures in the stdev)
-                        var stdevs = values.Take(i + 2).TakeLast(source.StdevCount).ToArray();
+                        // Measure stdev by picking the StdevCount results before the currently checked one
+                        var stdevs = values.Take(i + 1).TakeLast(source.StdevCount).ToArray();
 
                         if (stdevs.Length < source.StdevCount && probe.Unit == ThresholdUnits.StDev)
                         {
@@ -576,7 +607,25 @@ namespace Microsoft.Crank.RegressionBot
                         
                         if (_options.Verbose)
                         {
-                            Console.WriteLine($"Stdev: {standardDeviation} from values {JsonConvert.SerializeObject(stdevs)}");
+                            Console.WriteLine($"Building stdev ({standardDeviation}) from last {source.StdevCount} values {JsonConvert.SerializeObject(stdevs)}");
+                        }
+
+                        /*                      checked value (included in stdev)
+                         *                      ^                          ______/i+3---------i+4---------
+                         *  (stdev results) ----i---------i+1---------i+2/
+                         *         
+                         *                      <- value1 ->            <- value3 ->  
+                         *                      <------- value2 -------><------- value4 ------>
+                         *                 
+                         *
+                         */
+
+                        if (standardDeviation == 0)
+                        {
+                            // We skip measurement with stdev of zero since it could induce divisions by zero, and any change will trigger
+                            // a regression
+                            Console.WriteLine($"Ignoring measurement with stdev = 0");
+                            continue;
                         }
                         
                         var value1 = values[i+1] - values[i];
@@ -586,8 +635,9 @@ namespace Microsoft.Crank.RegressionBot
                         
                         if (_options.Verbose)
                         {
-                            Console.WriteLine($"{descriptor} {probe.Path} {resultSet[i+2].Result.DateTimeUtc} {values[i+0]} {values[i+1]} {values[i+2]} {values[i+3]} ({value3}) {values[i+4]} ({value4}) / {standardDeviation * probe.Threshold:n0}");
-                        }                        
+                            Console.WriteLine($"Next values: {values[i + 0]} {values[i + 1]} {values[i + 2]} {values[i + 3]} {values[i + 4]}");
+                            Console.WriteLine($"Deviations: {value1:n0} {value2:n0} {value3:n0} {value4:n0} Allowed deviation: {standardDeviation * probe.Threshold:n0}");
+                        }
 
                         var hasRegressed = false;
 
@@ -595,8 +645,8 @@ namespace Microsoft.Crank.RegressionBot
                         {
                             case ThresholdUnits.StDev:
                                 // factor of standard deviation
-                                hasRegressed = Math.Abs(value1) < standardDeviation
-                                    && Math.Abs(value2) < standardDeviation
+                                hasRegressed = Math.Abs(value1) < probe.Threshold * standardDeviation
+                                    && Math.Abs(value2) < probe.Threshold * standardDeviation
                                     && Math.Abs(value3) >= probe.Threshold * standardDeviation
                                     && Math.Abs(value4) >= probe.Threshold * standardDeviation
                                     && Math.Sign(value3) == Math.Sign(value4);
@@ -626,14 +676,6 @@ namespace Microsoft.Crank.RegressionBot
 
                         if (hasRegressed)
                         {
-                            if (_options.Verbose)
-                            {
-                                Console.ForegroundColor = ConsoleColor.Red;
-                                Console.WriteLine("Regression");
-                                Console.ResetColor();
-                            }
-
-                            
                             var regression = new Regression 
                             {
                                 PreviousResult = resultSet[i+2].Result,
@@ -642,6 +684,13 @@ namespace Microsoft.Crank.RegressionBot
                                 StandardDeviation = standardDeviation,
                                 Average = average
                             };
+
+                            if (_options.Verbose)
+                            {
+                                Console.ForegroundColor = ConsoleColor.Red;
+                                Console.WriteLine($"Regression detected: {values[i + 2]:n0} to {values[i + 3]:n0} for {regression.Identifier}");
+                                Console.ResetColor();
+                            }
 
                             foreach (var rule in rules)
                             {
@@ -671,7 +720,7 @@ namespace Microsoft.Crank.RegressionBot
                             
                             for (var j = i + 5; j < resultSet.Length; j++)
                             {
-                                var nextValue = Math.Abs(values[j] - values[i+2]);
+                                var nextValue = values[j] - values[i+2];
 
                                 var hasRecovered = false;
 
@@ -679,19 +728,19 @@ namespace Microsoft.Crank.RegressionBot
                                 {
                                     case ThresholdUnits.StDev:
                                         // factor of standard deviation
-                                        hasRecovered = nextValue < probe.Threshold * standardDeviation
+                                        hasRecovered = Math.Abs(nextValue) < probe.Threshold * standardDeviation
                                             && Math.Sign(nextValue) == Math.Sign(value4);
 
                                         break;
                                     case ThresholdUnits.Percent:
                                         // percentage of the average of values
-                                        hasRecovered = nextValue < average * (probe.Threshold / 100)
+                                        hasRecovered = Math.Abs(nextValue) < average * (probe.Threshold / 100)
                                             && Math.Sign(nextValue) == Math.Sign(value4);
 
                                         break;                            
                                     case ThresholdUnits.Absolute:
                                         // absolute deviation
-                                        hasRecovered = nextValue < probe.Threshold
+                                        hasRecovered = Math.Abs(nextValue) < probe.Threshold
                                             && Math.Sign(nextValue) == Math.Sign(value4);
 
                                         break;
@@ -711,7 +760,7 @@ namespace Microsoft.Crank.RegressionBot
                                 }
                             }
 
-                            yield return regression; 
+                            yield return regression;
                         }
                     }
                 }
@@ -738,7 +787,7 @@ namespace Microsoft.Crank.RegressionBot
                 Creator = _options.Username,
                 Filter = IssueFilter.Created,
                 State = ItemStateFilter.All,
-                Since = DateTimeOffset.Now.AddDays(0 - source.DaysOfRecentIssues)
+                Since = DateTimeOffset.Now.AddDays(0 - source.DaysToLoad)
             };
 
             var issues = await GetClient().Issue.GetAllForRepository(_options.RepositoryId, recently);
@@ -769,7 +818,7 @@ namespace Microsoft.Crank.RegressionBot
             Console.WriteLine($"Downloaded {issues.Count()} issues");
 
             // The list of regressions that remain to be reported
-            var regressionsToReport = new List<Regression>(regressions);
+            var regressionsToReport = new List<Regression>(regressions).ToDictionary(x => x.Identifier, x => x);
 
             foreach (var issue in issues)
             {
@@ -783,79 +832,68 @@ namespace Microsoft.Crank.RegressionBot
                     continue;
                 }
 
-                // For each issue, extract the regression and update their status (fixed).
-                // If all regressions are fixed, close the issue.
+                // For each issue, extract the regressions and update their status (recovered).
+                // If all regressions are recovered, close the issue.
 
-                var regressionSummaries = ExtractRegressionsBlock(issue.Body)?.ToDictionary(x => x.Identifier, x => x);
+                var existingRegressions = ExtractRegressionsBlock(issue.Body)?.ToDictionary(x => x.Identifier, x => x);
 
-                if (regressionSummaries == null)
+                if (existingRegressions == null)
                 {
                     continue;
                 }
 
-                // Find all regressions that are reported in this issue.
+                // Find all regressions that are reported in this issue, and check if they have recovered
 
-                var allRegressionsInIssue = regressions
-                    .Where(x => regressionSummaries.Keys.Contains(x.Identifier))
-                    .ToList();                
+                var issueNeedsUpdate = false;
 
-                // Remove all regressions that were found so they are not reported again.
+                // Update local regressions that have recovered
 
-                foreach (var r in allRegressionsInIssue)
+                foreach (var r in regressions)
                 {
-                    regressionsToReport.Remove(r);
+                    if (existingRegressions.TryGetValue(r.Identifier, out var localRegression))
+                    {
+                        // If the issue has been reported, exclude it
+                        if (regressionsToReport.Remove(r.Identifier))
+                        {
+                            Console.WriteLine($"Issue already reported {r.CurrentResult.Description} at {r.CurrentResult.DateTimeUtc}");
+                        }
+
+                        if (!localRegression.HasRecovered && r.HasRecovered)
+                        {
+                            Console.WriteLine($"Found update for {r.Identifier}");
+                            existingRegressions.Remove(r.Identifier);
+                            existingRegressions.Add(r.Identifier, r);
+                            issueNeedsUpdate = true;
+                        }
+                    }
                 }
 
-                // Only try to update an issue if all the regressions have been detected
-                if (allRegressionsInIssue.Count() == regressionSummaries.Count())
+                if (issueNeedsUpdate)
                 {
-                    // We could find all the regressions from this issue.
-                    // We can attempt to update it.
+                    Console.WriteLine("Updating issue...");
+                    var update = issue.ToUpdate();
 
-                    var issueNeedsUpdate = allRegressionsInIssue.Any(x => x.HasRecovered != regressionSummaries[x.Identifier].HasRecovered);
+                    update.Body = await CreateIssueBody(existingRegressions.Values, template);
 
-                    // Check if a custom marker is present to force the issue to be updated
-                    var updateRequested = issue.Body.Contains("<!-- update -->");
-
-                    if (updateRequested)
+                    // If all regressions have recovered, close it
+                    if (existingRegressions.Values.All(x => x.HasRecovered))
                     {
-                        Console.WriteLine("Update requested");
+                        Console.WriteLine("All regressions have recovered, closing the issue");
+                        update.State = ItemState.Closed;
                     }
 
-                    if (issueNeedsUpdate || updateRequested)
+                    if (!_options.ReadOnly)
                     {
-                        Console.WriteLine("Updating issue...");
-                        var update = issue.ToUpdate();
-
-                        update.Body = await CreateIssueBody(allRegressionsInIssue, template);
-
-                        // If all regressions have recovered, close it
-                        if (allRegressionsInIssue.All(x => x.HasRecovered))
-                        {
-                            Console.WriteLine("All regression have recovered, closing the issue");
-                            update.State = ItemState.Closed;
-                        }
-
-                        if (!_options.ReadOnly)
-                        {
-                            await GetClient().Issue.Update(_options.RepositoryId, issue.Number, update);
-                        }
-                    }
-                    else
-                    {
-                        Console.WriteLine("Issue doesn't need to be updated");
+                        await GetClient().Issue.Update(_options.RepositoryId, issue.Number, update);
                     }
                 }
                 else
                 {
-                    Console.WriteLine("Not all regressions were detected, skipping");
-                }
+                    Console.WriteLine("Issue doesn't need to be updated");
+                }                
             }
 
-            // Exclude all un-recovered issues to be reported on new issues
-            regressionsToReport = regressionsToReport.Where(x => !x.HasRecovered).ToList();
-
-            return regressionsToReport;
+            return regressionsToReport.Values;
         }
 
         private static GitHubClient GetClient()
@@ -920,21 +958,20 @@ namespace Microsoft.Crank.RegressionBot
             }
         }
         
-        private static string RegressionsPrefix = "{Regressions}";
-        private static string RegressionsSuffix = "{/Regressions}";
+        private static string RegressionsPrefix = "[MSGPACK]";
+        private static string RegressionsSuffix = "[/MSGPACK]";
         
         private static string CreateRegressionsBlock(IEnumerable<Regression> regressions)
         {
             // A custom Base64 payload is injected as a comment in the issue such that we
             // can come back on the issue to update its content
 
-            var summaries = regressions.Select(x => new RegressionSummary { Identifier = x.Identifier, HasRecovered = x.HasRecovered });
-            var json = JsonConvert.SerializeObject(summaries, Formatting.None);
-            var base64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(json));
+            var data = MessagePackSerializer.Serialize(regressions, MessagePack.Resolvers.ContractlessStandardResolver.Options);
+            var base64 = Convert.ToBase64String(data);
             return $"<!-- {RegressionsPrefix}{base64}{RegressionsSuffix} -->";
         }
 
-        private static IEnumerable<RegressionSummary> ExtractRegressionsBlock(string body)
+        private static IEnumerable<Regression> ExtractRegressionsBlock(string body)
         {
             var start = body.IndexOf(RegressionsPrefix);
 
@@ -954,24 +991,21 @@ namespace Microsoft.Crank.RegressionBot
 
             var base64 = body.Substring(start, end - start);
 
-            if (_options.Verbose)
-            {
-                Console.WriteLine($"Base64: {base64}");
-            }
-
             try
             {
-                var json = Encoding.UTF8.GetString(Convert.FromBase64String(base64));
-                return JsonConvert.DeserializeObject<RegressionSummary[]>(json);
+                var data = Convert.FromBase64String(base64);
+                var results = MessagePackSerializer.Deserialize<Regression[]>(data, MessagePack.Resolvers.ContractlessStandardResolver.Options);
+                Console.WriteLine($"Loaded {results.Length} regressions");
+                return results;
             }
-            catch
+            catch (Exception e)
             {
                 if (_options.Verbose)
                 {
-                    Console.WriteLine($"Error while parsing regression summaries");
+                    Console.WriteLine($"Error while parsing regressions: {e}");
                 }
 
-                return null;
+                return Array.Empty<Regression>();
             }
         }
     }
