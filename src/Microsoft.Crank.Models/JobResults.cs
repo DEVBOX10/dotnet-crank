@@ -4,9 +4,8 @@
 
 using System;
 using System.Collections.Generic;
-using Microsoft.Crank.Models;
 
-namespace Microsoft.Crank.Controller
+namespace Microsoft.Crank.Models
 {
     public class JobResults
     {
@@ -18,6 +17,7 @@ namespace Microsoft.Crank.Controller
     {
         public Dictionary<string, object> Results { get; set; } = new Dictionary<string, object>();
         public ResultMetadata[] Metadata { get; set; } = Array.Empty<ResultMetadata>();
+        public Dependency[] Dependencies { get; set; } = Array.Empty<Dependency>();
         public List<Measurement[]> Measurements { get; set; } = new List<Measurement[]>();
         public Dictionary<string, object> Environment { get; set; } = new Dictionary<string, object>();
     }

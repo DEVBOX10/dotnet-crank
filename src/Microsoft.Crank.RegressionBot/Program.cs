@@ -34,11 +34,12 @@ namespace Microsoft.Crank.RegressionBot
         private static readonly HttpClient _httpClient;
         private static readonly HttpClientHandler _httpClientHandler;
 
-        static readonly TimeSpan RecentIssuesTimeSpan = TimeSpan.FromDays(8);
-
         static BotOptions _options;
         static Credentials _credentials;
         static IReadOnlyList<Issue> _recentIssues;
+
+        static TemplateOptions _templateOptions = new TemplateOptions();
+        static FluidParser _fluidParser = new FluidParser();
         
         static Program()
         {
@@ -49,12 +50,14 @@ namespace Microsoft.Crank.RegressionBot
 
             _httpClient = new HttpClient(_httpClientHandler);
 
-            TemplateContext.GlobalMemberAccessStrategy.Register<BenchmarksResult>();
-            TemplateContext.GlobalMemberAccessStrategy.Register<Report>();
-            TemplateContext.GlobalMemberAccessStrategy.Register<Regression>();
-            TemplateContext.GlobalMemberAccessStrategy.Register<JObject, object>((obj, name) => obj[name]);
-            FluidValue.SetTypeMapping<JObject>(o => new ObjectValue(o));
-            FluidValue.SetTypeMapping<JValue>(o => FluidValue.Create(o.Value));
+            _templateOptions.MemberAccessStrategy = UnsafeMemberAccessStrategy.Instance;
+
+            // When a property of a JObject value is accessed, try to look into its properties
+            _templateOptions.MemberAccessStrategy.Register<JObject, object>((source, name) => source[name]);
+
+            // Convert JToken to FluidValue
+            _templateOptions.ValueConverters.Add(x => x is JObject o ? new ObjectValue(o) : null);
+            _templateOptions.ValueConverters.Add(x => x is JValue v ? v.Value : null);
         }
 
         static async Task<int> Main(string[] args)
@@ -205,7 +208,7 @@ namespace Microsoft.Crank.RegressionBot
                 }
 
                 var template = templates[s.Regressions.Template];
-                
+
                 var regressions = await FindRegression(s).ToListAsync();
 
                 if (!regressions.Any())
@@ -214,7 +217,7 @@ namespace Microsoft.Crank.RegressionBot
                 }
 
                 Console.WriteLine($"Found {regressions.Count()} regressions");
-                
+
                 Console.WriteLine("Updating existing issues...");
 
                 // The result of updating issues is the list of regressions that are not yet reported
@@ -223,31 +226,38 @@ namespace Microsoft.Crank.RegressionBot
                 Console.WriteLine($"{newRegressions.Count()} of them were not reported");
 
                 // Exclude all regressions that have recovered, and have not been reported
-                newRegressions = newRegressions.Where(x => !x.HasRecovered);
+                newRegressions = newRegressions.Where(x => !x.HasRecovered).ToArray();
 
                 Console.WriteLine($"{newRegressions.Count()} of them have not recovered");
+
+                // Group issues by trend, such that all improvements are in the same issue
+                var positiveRegressions = newRegressions.Where(x => x.Change >= 0).ToArray();
+                var negativeRegressions = newRegressions.Where(x => x.Change < 0).ToArray();
 
                 if (newRegressions.Any())
                 {
                     Console.WriteLine("Reporting new regressions...");
 
-                    if (_options.Verbose)
+                    foreach (var regressionSet in new[] { positiveRegressions, negativeRegressions })
                     {
-                        Console.WriteLine(JsonConvert.SerializeObject(newRegressions, Formatting.None));
-                    }
+                        if (_options.Verbose)
+                        {
+                            Console.WriteLine(JsonConvert.SerializeObject(regressionSet, Formatting.None));
+                        }
 
-                    var skip = 0;
-                    var pageSize = 10;
+                        var skip = 0;
+                        var pageSize = 10;
 
-                    while (true)
-                    {
-                        // Create issues with 10 regressions per issue max
-                        var page = newRegressions.Skip(skip).Take(pageSize);
+                        while (true)
+                        {
+                            // Create issues with 10 regressions per issue max
+                            var page = regressionSet.Skip(skip).Take(pageSize);
 
-                        if (!page.Any()) break;
+                            if (!page.Any()) break;
 
-                        await CreateRegressionIssue(page, template);
-                        skip += pageSize;
+                            await CreateRegressionIssue(page, s.Regressions.Title, template);
+                            skip += pageSize;
+                        }
                     }
                 }
                 else
@@ -266,7 +276,10 @@ namespace Microsoft.Crank.RegressionBot
                 Regressions = regressions.OrderBy(x => x.CurrentResult.Scenario).ThenBy(x => x.CurrentResult.DateTimeUtc).ToList()
             };
 
-            if (!FluidTemplate.TryParse(template, out var fluidTemplate, out var errors))
+            // The base64 encoded MessagePack-serialized model
+            var regressionBlock = CreateRegressionsBlock(regressions);
+
+            if (!_fluidParser.TryParse(template, out var fluidTemplate, out var errors))
             {   
                 Console.WriteLine("Error parsing the template:");
                 foreach (var error in errors)
@@ -277,32 +290,77 @@ namespace Microsoft.Crank.RegressionBot
                 return "";
             }
 
-            var context = new TemplateContext { Model = report };
+            var context = new TemplateContext(report, _templateOptions);
 
-            var body = await fluidTemplate.RenderAsync(context);
+            try
+            {
+                var body = await fluidTemplate.RenderAsync(context);
 
-            body = AddOwners(body, regressions);
+                body = AddOwners(body, regressions);
 
-            body += CreateRegressionsBlock(regressions);
+                body += regressionBlock;
 
-            return body;
+                return body;
+            }
+            catch (Exception e)
+            {
+                Console.WriteLine($"An error occurred while rendering an issue: {e}");
+                Console.WriteLine("[DEBUG] Model used:");
+                Console.WriteLine(regressionBlock);
+
+                throw;
+            }
         }
 
-        private static async Task CreateRegressionIssue(IEnumerable<Regression> regressions, string template)
+        private static async Task<string> CreateIssueTitle(IEnumerable<Regression> regressions, string template)
+        {
+            var report = new Report
+            {
+                Regressions = regressions.OrderBy(x => x.CurrentResult.Scenario).ThenBy(x => x.CurrentResult.DateTimeUtc).ToList()
+            };
+
+            var title = "";
+
+            if (String.IsNullOrWhiteSpace(template))
+            {
+                title = "Performance difference: " + String.Join(", ", regressions.Select(x => x.CurrentResult.Scenario).Take(5));
+
+                if (regressions.Count() > 5)
+                {
+                    title += " ...";
+                }
+            }
+            else
+            {
+                if (!_fluidParser.TryParse(template, out var fluidTemplate, out var errors))
+                {
+                    Console.WriteLine("Error parsing the template:");
+                    foreach (var error in errors)
+                    {
+                        Console.WriteLine(error);
+                    }
+
+                    return "";
+                }
+
+                var context = new TemplateContext(report, _templateOptions);
+
+                title = await fluidTemplate.RenderAsync(context);
+            }
+
+            return title;
+        }
+
+        private static async Task CreateRegressionIssue(IEnumerable<Regression> regressions, string titleTemplate, string bodyTemplate)
         {
             if (regressions == null || !regressions.Any())
             {
                 return;
             }
 
-            var body = await CreateIssueBody(regressions, template);            
-            
-            var title = "Performance difference: " + String.Join(", ", regressions.Select(x => x.CurrentResult.Scenario).Take(5));
+            var body = await CreateIssueBody(regressions, bodyTemplate);
 
-            if (regressions.Count() > 5)
-            {
-                title += " ...";
-            }
+            var title = await CreateIssueTitle(regressions, titleTemplate);
 
             if (!_options.Debug)
             {
@@ -414,7 +472,7 @@ namespace Microsoft.Crank.RegressionBot
                         if (!validationResults.IsValid)
                         {
                             // Create a json debug file with the schema
-                            localconfiguration.AddFirst(new JProperty("$schema", "https://raw.githubusercontent.com/dotnet/crank/master/src/Microsoft.Crank.RegressionBot/regressionbot.schema.json"));
+                            localconfiguration.AddFirst(new JProperty("$schema", "https://raw.githubusercontent.com/dotnet/crank/main/src/Microsoft.Crank.RegressionBot/regressionbot.schema.json"));
 
                             var debugFilename = Path.Combine(Path.GetTempPath(), "configuration.debug.json");
                             File.WriteAllText(debugFilename, localconfiguration.ToString(Formatting.Indented));
@@ -614,10 +672,10 @@ namespace Microsoft.Crank.RegressionBot
                          *                      ^                          ______/i+3---------i+4---------
                          *  (stdev results) ----i---------i+1---------i+2/
                          *         
-                         *                      <- value1 ->            <- value3 ->  
-                         *                      <------- value2 -------><------- value4 ------>
-                         *                 
-                         *
+                         *                      <- value1 ->            
+                         *                      <------- value2 ------->
+                         *                      <--------------- value3 --------->  
+                         *                      <------------------------ value4 ------------->
                          */
 
                         if (standardDeviation == 0)
@@ -630,8 +688,8 @@ namespace Microsoft.Crank.RegressionBot
                         
                         var value1 = values[i+1] - values[i];
                         var value2 = values[i+2] - values[i];
-                        var value3 = values[i+3] - values[i+2];
-                        var value4 = values[i+4] - values[i+2];
+                        var value3 = values[i+3] - values[i];
+                        var value4 = values[i+4] - values[i];
                         
                         if (_options.Verbose)
                         {
@@ -716,11 +774,13 @@ namespace Microsoft.Crank.RegressionBot
                             }
 
                             // If there are subsequent measurements, detect if the benchmark has 
-                            // recovered by search for a value in the limits
+                            // recovered
+                            // - if the delta is inside the threshold limits
+                            // - the delta is outside the threshold limits but in the opposite sign
                             
                             for (var j = i + 5; j < resultSet.Length; j++)
                             {
-                                var nextValue = values[j] - values[i+2];
+                                var nextValue = values[j] - values[i];
 
                                 var hasRecovered = false;
 
@@ -728,20 +788,26 @@ namespace Microsoft.Crank.RegressionBot
                                 {
                                     case ThresholdUnits.StDev:
                                         // factor of standard deviation
-                                        hasRecovered = Math.Abs(nextValue) < probe.Threshold * standardDeviation
-                                            && Math.Sign(nextValue) == Math.Sign(value4);
+                                        hasRecovered = Math.Sign(nextValue) == Math.Sign(value4)
+                                            ? Math.Abs(nextValue) < probe.Threshold * standardDeviation
+                                            : Math.Abs(nextValue) >= probe.Threshold * standardDeviation
+                                            ;
 
                                         break;
                                     case ThresholdUnits.Percent:
                                         // percentage of the average of values
-                                        hasRecovered = Math.Abs(nextValue) < average * (probe.Threshold / 100)
-                                            && Math.Sign(nextValue) == Math.Sign(value4);
+                                        hasRecovered = Math.Sign(nextValue) == Math.Sign(value4)
+                                            ? Math.Abs(nextValue) < average * (probe.Threshold / 100)
+                                            : Math.Abs(nextValue) >= average * (probe.Threshold / 100)
+                                            ;
 
                                         break;                            
                                     case ThresholdUnits.Absolute:
                                         // absolute deviation
-                                        hasRecovered = Math.Abs(nextValue) < probe.Threshold
-                                            && Math.Sign(nextValue) == Math.Sign(value4);
+                                        hasRecovered = Math.Sign(nextValue) == Math.Sign(value4)
+                                            ? Math.Abs(nextValue) < probe.Threshold
+                                            : Math.Abs(nextValue) >= probe.Threshold
+                                            ;
 
                                         break;
                                     default:
@@ -760,6 +826,8 @@ namespace Microsoft.Crank.RegressionBot
                                 }
                             }
 
+                            regression.ComputeChanges();
+
                             yield return regression;
                         }
                     }
@@ -768,7 +836,7 @@ namespace Microsoft.Crank.RegressionBot
         }
 
         /// <summary>
-        /// Returns the issues from the past <see cref="RecentIssuesTimeSpan"/>
+        /// Returns the issues from the past
         /// </summary>
         private static async Task<IReadOnlyList<Issue>> GetRecentIssues(Source source)
         {

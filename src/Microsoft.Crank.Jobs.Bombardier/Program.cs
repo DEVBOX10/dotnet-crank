@@ -94,6 +94,8 @@ namespace Microsoft.Crank.Jobs.Bombardier
                 using (var fileStream = File.Create(bombardierFileName))
                 {
                     await downloadStream.CopyToAsync(fileStream);
+                    await fileStream.FlushAsync();
+                    await downloadStream.FlushAsync();
                 }
             }
             
@@ -176,78 +178,89 @@ namespace Microsoft.Crank.Jobs.Bombardier
                     return process.ExitCode;
                 }
             }
+            else
+            {
+                Console.WriteLine("Warmup skipped");
+            }
 
             lock (stringBuilder)
             {
                 stringBuilder.Clear();
             }
 
-            process.StartInfo.Arguments =
-                requests > 0
-                    ? $" -n {requests} {baseArguments}"
-                    : $" -d {duration}s {baseArguments}";
-
-            Console.WriteLine("> bombardier " + process.StartInfo.Arguments);
-            
-            await StartProcessWithRetriesAsync(process);
-
-            BenchmarksEventSource.SetChildProcessId(process.Id);
-
-            process.BeginOutputReadLine();
-            process.WaitForExit();
-
-            if (process.ExitCode != 0)
+            if (duration > 0)
             {
-                return process.ExitCode;
+                process.StartInfo.Arguments =
+                    requests > 0
+                        ? $" -n {requests} {baseArguments}"
+                        : $" -d {duration}s {baseArguments}";
+
+                Console.WriteLine("> bombardier " + process.StartInfo.Arguments);
+                
+                await StartProcessWithRetriesAsync(process);
+
+                BenchmarksEventSource.SetChildProcessId(process.Id);
+
+                process.BeginOutputReadLine();
+                process.WaitForExit();
+
+                if (process.ExitCode != 0)
+                {
+                    return process.ExitCode;
+                }
+
+                string output;
+
+                lock (stringBuilder)
+                {
+                    output = stringBuilder.ToString();
+                }
+
+                var document = JObject.Parse(output);
+
+                BenchmarksEventSource.Register("bombardier/requests;http/requests", Operations.Max, Operations.Sum, "Requests", "Total number of requests", "n0");
+                BenchmarksEventSource.Register("bombardier/badresponses;http/requests/badresponses", Operations.Max, Operations.Sum, "Bad responses", "Non-2xx or 3xx responses", "n0");
+
+                BenchmarksEventSource.Register("bombardier/latency/mean;http/latency/mean", Operations.Max, Operations.Avg, "Mean latency (us)", "Mean latency (us)", "n0");
+                BenchmarksEventSource.Register("bombardier/latency/max;http/latency/max", Operations.Max, Operations.Max, "Max latency (us)", "Max latency (us)", "n0");
+
+                BenchmarksEventSource.Register("bombardier/rps/mean;http/rps/mean", Operations.Max, Operations.Sum, "Requests/sec", "Requests per second", "n0");
+                BenchmarksEventSource.Register("bombardier/rps/max;http/rps/max", Operations.Max, Operations.Sum, "Requests/sec (max)", "Max requests per second", "n0");
+                BenchmarksEventSource.Register("bombardier/throughput;http/throughput", Operations.Max, Operations.Sum, "Read throughput (MB/s)", "Read throughput (MB/s)", "n2");
+
+                BenchmarksEventSource.Register("bombardier/raw", Operations.All, Operations.All, "Raw results", "Raw results", "json");
+
+                var total =
+                    document["result"]["req1xx"].Value<long>()
+                    + document["result"]["req2xx"].Value<long>()
+                    + document["result"]["req3xx"].Value<long>()
+                    + document["result"]["req3xx"].Value<long>()
+                    + document["result"]["req4xx"].Value<long>()
+                    + document["result"]["req5xx"].Value<long>()
+                    + document["result"]["others"].Value<long>();
+
+                var success = document["result"]["req2xx"].Value<long>() + document["result"]["req3xx"].Value<long>();
+
+                BenchmarksEventSource.Measure("bombardier/requests;http/requests", total);
+                BenchmarksEventSource.Measure("bombardier/badresponses;http/requests/badresponses", total - success);
+
+                BenchmarksEventSource.Measure("bombardier/latency/mean;http/latency/mean", document["result"]["latency"]["mean"].Value<double>());
+                BenchmarksEventSource.Measure("bombardier/latency/max;http/latency/max", document["result"]["latency"]["max"].Value<double>());
+
+                BenchmarksEventSource.Measure("bombardier/rps/max;http/rps/max", document["result"]["rps"]["max"].Value<double>());
+                BenchmarksEventSource.Measure("bombardier/rps/mean;http/rps/mean", document["result"]["rps"]["mean"].Value<double>());
+
+                BenchmarksEventSource.Measure("bombardier/raw", output);
+
+                var bytesPerSecond = document["result"]["bytesRead"].Value<long>() / document["result"]["timeTakenSeconds"].Value<double>();
+
+                // B/s to MB/s
+                BenchmarksEventSource.Measure("bombardier/throughput", bytesPerSecond / 1024 / 1024);
             }
-
-            string output;
-
-            lock (stringBuilder)
+            else
             {
-                output = stringBuilder.ToString();
+                Console.WriteLine("Benchmark skipped");
             }
-
-            var document = JObject.Parse(output);
-
-            BenchmarksEventSource.Register("bombardier/requests", Operations.Max, Operations.Sum, "Requests", "Total number of requests", "n0");
-            BenchmarksEventSource.Register("bombardier/badresponses", Operations.Max, Operations.Sum, "Bad responses", "Non-2xx or 3xx responses", "n0");
-
-            BenchmarksEventSource.Register("bombardier/latency/mean", Operations.Max, Operations.Sum, "Mean latency (us)", "Mean latency (us)", "n0");
-            BenchmarksEventSource.Register("bombardier/latency/max", Operations.Max, Operations.Sum, "Max latency (us)", "Max latency (us)", "n0");
-
-            BenchmarksEventSource.Register("bombardier/rps/mean", Operations.Max, Operations.Sum, "Requests/sec", "Requests per second", "n0");
-            BenchmarksEventSource.Register("bombardier/rps/max", Operations.Max, Operations.Sum, "Requests/sec (max)", "Max requests per second", "n0");
-            BenchmarksEventSource.Register("bombardier/throughput", Operations.Max, Operations.Sum, "Read throughput (MB/s)", "Read throughput (MB/s)", "n2");
-
-            BenchmarksEventSource.Register("bombardier/raw", Operations.All, Operations.All, "Raw results", "Raw results", "json");
-
-            var total =
-                document["result"]["req1xx"].Value<long>()
-                + document["result"]["req2xx"].Value<long>()
-                + document["result"]["req3xx"].Value<long>()
-                + document["result"]["req3xx"].Value<long>()
-                + document["result"]["req4xx"].Value<long>()
-                + document["result"]["req5xx"].Value<long>()
-                + document["result"]["others"].Value<long>();
-
-            var success = document["result"]["req2xx"].Value<long>() + document["result"]["req3xx"].Value<long>();
-
-            BenchmarksEventSource.Measure("bombardier/requests", total);
-            BenchmarksEventSource.Measure("bombardier/badresponses", total - success);
-
-            BenchmarksEventSource.Measure("bombardier/latency/mean", document["result"]["latency"]["mean"].Value<double>());
-            BenchmarksEventSource.Measure("bombardier/latency/max", document["result"]["latency"]["max"].Value<double>());
-
-            BenchmarksEventSource.Measure("bombardier/rps/max", document["result"]["rps"]["max"].Value<double>());
-            BenchmarksEventSource.Measure("bombardier/rps/mean", document["result"]["rps"]["mean"].Value<double>());
-
-            BenchmarksEventSource.Measure("bombardier/raw", output);
-
-            var bytesPerSecond = document["result"]["bytesRead"].Value<long>() / document["result"]["timeTakenSeconds"].Value<double>();
-
-            // B/s to MB/s
-            BenchmarksEventSource.Measure("bombardier/throughput", bytesPerSecond / 1024 / 1024);
 
             // Clean temporary files
             try
@@ -312,7 +325,7 @@ namespace Microsoft.Crank.Jobs.Bombardier
                 return;
             }
 
-            var cts = new CancellationTokenSource(5000);
+            var cts = new CancellationTokenSource(30000);
             var httpMessage = new HttpRequestMessage(HttpMethod.Get, url);
 
             var stopwatch = new Stopwatch();

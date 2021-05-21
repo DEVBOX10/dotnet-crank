@@ -41,7 +41,8 @@ namespace Microsoft.Crank.Controller
         private const string DefaultBenchmarkDotNetArguments = "--inProcess --cli {{benchmarks-cli}} --join --exporters briefjson markdown";
 
         // Default to arguments which should be sufficient for collecting trace of default Plaintext run
-        private const string _defaultTraceArguments = "BufferSizeMB=1024;CircularMB=1024;clrEvents=JITSymbols;kernelEvents=process+thread+ImageLoad+Profile";
+        // c.f. https://github.com/Microsoft/perfview/blob/main/src/PerfView/CommandLineArgs.cs
+        private const string _defaultTraceArguments = "BufferSizeMB=1024;CircularMB=4096;TplEvents=None";
 
         private static ScriptConsole _scriptConsole = new ScriptConsole();
 
@@ -50,7 +51,7 @@ namespace Microsoft.Crank.Controller
             _scenarioOption,
             _jobOption,
             _profileOption,
-            _outputOption,
+            _jsonOption,
             _compareOption,
             _variableOption,
             _sqlConnectionStringOption,
@@ -66,11 +67,13 @@ namespace Microsoft.Crank.Controller
             _renderChartOption,
             _chartTypeOption,
             _chartScaleOption,
-            _displayIterationsOption,
             _iterationsOption,
+            _intervalOption,
             _verboseOption,
             _quietOption,
-            _scriptOption
+            _scriptOption,
+            _excludeOption,
+            _excludeOrderOption
             ;
 
         // The dynamic arguments that will alter the configurations
@@ -78,16 +81,11 @@ namespace Microsoft.Crank.Controller
 
         private static Dictionary<string, string> _deprecatedArguments = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
-            { "--projectfile", "--project-file" },
-            { "--outputfile", "--output-file" },
-            { "--clientName", "--client-name" }
+            { "--output", "--json" }, { "-o", "-j" } // todo: remove in subsequent version prefix
         };
 
         private static Dictionary<string, string> _synonymArguments = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
-            { "--aspnet", "--aspnetcoreversion" },
-            { "--runtime", "--runtimeversion" },
-            { "--clientThreads", "--client-threads" },
         };
 
         static Program()
@@ -117,7 +115,7 @@ namespace Microsoft.Crank.Controller
 
                 if (_deprecatedArguments.TryGetValue(arg, out var mappedArg))
                 {
-                    Log.Write($"WARNING: '{arg}' has been deprecated, in the future please use '{mappedArg}'.");
+                    Log.WriteWarning($"WARNING: '{arg}' has been deprecated, in the future please use '{mappedArg}'.");
                     args[i] = mappedArg;
                 }
                 else if (_synonymArguments.TryGetValue(arg, out var synonymArg))
@@ -130,8 +128,9 @@ namespace Microsoft.Crank.Controller
             var app = new CommandLineApplication()
             {
                 Name = "Crank",
-                FullName = "ASP.NET Benchmarks Controller",
-                Description = "Crank orchestrates benchmark jobs on Crank agents.",
+                FullName = "Crank Benchmarks Controller",
+                ExtendedHelpText = Documentation.Content,
+                Description = "The Crank controller orchestrates benchmark jobs on Crank agents.",
                 ResponseFileHandling = ResponseFileHandling.ParseArgsAsSpaceSeparated,
                 OptionsComparison = StringComparison.OrdinalIgnoreCase,
             };
@@ -143,7 +142,7 @@ namespace Microsoft.Crank.Controller
             _jobOption = app.Option("-j|--job", "Name of job to define", CommandOptionType.MultipleValue);
             _profileOption = app.Option("--profile", "Profile name", CommandOptionType.MultipleValue);
             _scriptOption = app.Option("--script", "Execute a named script available in the configuration files. Can be used multiple times.", CommandOptionType.MultipleValue);
-            _outputOption = app.Option("-o|--output", "Output filename", CommandOptionType.SingleValue);
+            _jsonOption = app.Option("-j|--json", "Saves the results as json in the specified file.", CommandOptionType.SingleValue);
             _compareOption = app.Option("--compare", "An optional filename to compare the results to. Can be used multiple times.", CommandOptionType.MultipleValue);
             _variableOption = app.Option("--variable", "Variable", CommandOptionType.MultipleValue);
             _sqlConnectionStringOption = app.Option("--sql",
@@ -162,9 +161,11 @@ namespace Microsoft.Crank.Controller
             _chartTypeOption = app.Option("--chart-type", "Type of chart to render. Values are 'bar' (default) or 'hex'", CommandOptionType.SingleValue);
             _chartScaleOption = app.Option("--chart-scale", "Scale for chart. Values are 'off' (default) or 'auto'. When scale is off, the min value starts at 0.", CommandOptionType.SingleValue);
             _iterationsOption = app.Option("-i|--iterations", "The number of iterations.", CommandOptionType.SingleValue);
+            _intervalOption = app.Option("-m|--interval", "The measurements interval in seconds. Default is 1.", CommandOptionType.SingleValue);
             _verboseOption = app.Option("-v|--verbose", "Verbose output", CommandOptionType.NoValue);
             _quietOption = app.Option("--quiet", "Quiet output, only the results are displayed", CommandOptionType.NoValue);
-            _displayIterationsOption = app.Option("-di|--display-iterations", "Displays intermediate iterations results.", CommandOptionType.NoValue);
+            _excludeOption = app.Option("-x|--exclude", "Excludes the specified number of high and low results, e.g., 1, 1:0 (exclude the lowest), 0:3 (exclude the 3 highest)", CommandOptionType.SingleValue);
+            _excludeOrderOption = app.Option("-xo|--exclude-order", "The result to use to detect the high and low results, e.g., 'load:wrk/rps/mean'", CommandOptionType.SingleValue);
             
             app.Command("compare", compareCmd =>
             {
@@ -176,6 +177,9 @@ namespace Microsoft.Crank.Controller
                     return ResultComparer.Compare(files.Values);
                 });
             });
+
+            // Store arguments before the dynamic ones are removed
+            var commandLineArguments = String.Join(' ', args.Where(x => !String.IsNullOrWhiteSpace(x)));
 
             // Extract dynamic arguments
             for (var i = 0; i < args.Length; i++)
@@ -205,7 +209,8 @@ namespace Microsoft.Crank.Controller
 
                 var session = _sessionOption.Value();
                 var iterations = 1;
-                var exclude = 0;
+                var exclude = ExcludeOptions.Empty;
+
                 var span = TimeSpan.Zero;
 
                 if (string.IsNullOrEmpty(session))
@@ -214,6 +219,25 @@ namespace Microsoft.Crank.Controller
                 }
 
                 var description = _descriptionOption.Value() ?? "";
+
+                var interval = 1;
+
+                if (_intervalOption.HasValue())
+                {
+                    if (!int.TryParse(_intervalOption.Value(), out interval))
+                    {
+                        Console.WriteLine($"The option --interval must be a valid integer.");
+                        return -1;
+                    }
+                    else
+                    {
+                        if (interval < 1)
+                        {
+                            Console.WriteLine($"The option --interval must be greater than 1.");
+                            return -1;
+                        }
+                    }
+                }
 
                 if (_iterationsOption.HasValue())
                 {
@@ -228,6 +252,74 @@ namespace Microsoft.Crank.Controller
                         Console.WriteLine($"Invalid value for iterations arguments. A positive integer was expected.");
                         return -1;
                     }
+                }
+
+                var excludeOptions = 
+                    Convert.ToInt32(_excludeOption.HasValue()) 
+                    + Convert.ToInt32(_excludeOrderOption.HasValue())
+                    ;
+
+                if (excludeOptions > 0 && excludeOptions != 2)
+                {
+                    Console.WriteLine("All exclude options need to be set: --exclude, --exclude-order.");
+                    return -1;
+                }
+
+                int excludeLow = 0, excludeHigh = 0;
+
+                if (_excludeOption.HasValue())
+                {
+                    if (!_iterationsOption.HasValue())
+                    {
+                        Console.WriteLine("The option --exclude can only be used with --iterations.");
+                        return -1;
+                    }
+
+                    var segments = _excludeOption.Value().Split(':', 2, StringSplitOptions.RemoveEmptyEntries);
+
+                    if (segments.Length == 1)
+                    {
+                        if (!Int32.TryParse(segments[0], out excludeLow) || excludeLow < 1)
+                        {
+                            Console.WriteLine($"Invalid value for --exclude <x> option. A positive integer was expected.");
+                            return -1;
+                        }
+
+                        excludeHigh = excludeLow;
+                    }
+                    else if (segments.Length == 2)
+                    {
+                        if (!Int32.TryParse(segments[0], out excludeLow) || excludeLow < 1)
+                        {
+                            Console.WriteLine($"Invalid value for --exclude <low:high> option. A positive integer was expected as the lower value.");
+                            return -1;
+                        }
+
+                        if (!Int32.TryParse(segments[1], out excludeHigh) || excludeHigh < 1)
+                        {
+                            Console.WriteLine($"Invalid value for --exclude <low:high> option. A positive integer was expected as the higher value.");
+                            return -1;
+                        }
+                    }
+
+                    if (iterations <= excludeLow + excludeHigh)
+                    {
+                        Console.WriteLine($"Invalid value for --exclude option. Remaining benchmarks number is negative.");
+                        return -1;
+                    }
+
+                    var excludeOrder = _excludeOrderOption.Value().Split(':', 2, StringSplitOptions.RemoveEmptyEntries);
+
+                    if (excludeOrder.Length != 2)
+                    {
+                        Console.WriteLine("The option -xo|--exclude-order format is <job>:<result>, e.g., 'load:wrk/rps/mean'");
+                        return -1;
+                    }
+
+                    exclude.Low = excludeLow;
+                    exclude.High = excludeHigh;
+                    exclude.Job = excludeOrder[0];
+                    exclude.Result = excludeOrder[1];
                 }
 
                 if (_spanOption.HasValue() && !TimeSpan.TryParse(_spanOption.Value(), out span))
@@ -322,7 +414,7 @@ namespace Microsoft.Crank.Controller
                     }
                 }
 
-                var configuration = await BuildConfigurationAsync(_configOption.Values, scenarioName, _jobOption.Values, Arguments, variables, _profileOption.Values, _scriptOption.Values);
+                var configuration = await BuildConfigurationAsync(_configOption.Values, scenarioName, _jobOption.Values, Arguments, variables, _profileOption.Values, _scriptOption.Values, interval);
 
                 // Storing the list of services to run as part of the selected scenario
                 var dependencies = String.IsNullOrEmpty(scenarioName)
@@ -340,6 +432,8 @@ namespace Microsoft.Crank.Controller
                     var service = configuration.Jobs[jobName];
 
                     service.RunId = groupId;
+                    service.Origin = Environment.MachineName;
+                    service.CrankArguments = commandLineArguments;
 
                     if (String.IsNullOrEmpty(service.Source.Project) &&
                         String.IsNullOrEmpty(service.Source.DockerFile) &&
@@ -430,9 +524,9 @@ namespace Microsoft.Crank.Controller
 
                     if (_scenarioOption.HasValue())
                     {
-                        if (_outputOption.HasValue())
+                        if (_jsonOption.HasValue())
                         {
-                            jobName = Path.GetFileNameWithoutExtension(_outputOption.Value());
+                            jobName = Path.GetFileNameWithoutExtension(_jsonOption.Value());
                         }
                     }
 
@@ -463,7 +557,7 @@ namespace Microsoft.Crank.Controller
             string[] dependencies,
             string session,
             int iterations,
-            int exclude,
+            ExcludeOptions exclude,
             IEnumerable<string> scripts
             )
         {
@@ -643,12 +737,14 @@ namespace Microsoft.Crank.Controller
                                     {
                                         if (!String.IsNullOrEmpty(job.Job.Error))
                                         {
-                                            Log.Write(job.Job.Error, notime: true, error: true);
+                                            Log.WriteError(job.Job.Error, notime: true);
 
                                             // It might be necessary to get the formal exit code from the remove job
                                             executionResult.ReturnCode = 1;
                                         }
                                     }
+
+                                    await Task.WhenAll(jobs.Select(job => job.DownloadDumpAsync()));
 
                                     await Task.WhenAll(jobs.Select(job => job.DownloadTraceAsync()));
 
@@ -718,6 +814,8 @@ namespace Microsoft.Crank.Controller
                         // Unless the jobs can't be stopped
                         if (!SpanShouldKeepJobRunning(jobName))
                         {
+                            await Task.WhenAll(jobs.Select(job => job.DownloadDumpAsync()));
+
                             await Task.WhenAll(jobs.Select(job => job.DownloadTraceAsync()));
 
                             await Task.WhenAll(jobs.Select(job => job.DownloadAssetsAsync(jobName)));
@@ -775,6 +873,33 @@ namespace Microsoft.Crank.Controller
                 // If last iteration, create average and display results
                 if (iterations > 1 && i == iterations)
                 {
+                    // Exclude highs and lows
+
+                    if (exclude.High + exclude.Low > 0)
+                    {
+                        if (executionResults.Any(x => !x.JobResults.Jobs.ContainsKey(exclude.Job)))
+                        {
+                            Log.WriteWarning($"A benchmark didn't contain the expected job '{exclude.Job}', the exclusion will be ignored.");
+                        }
+                        else if (executionResults.Any(x => !x.JobResults.Jobs[exclude.Job].Results.ContainsKey(exclude.Result) ))
+                        {
+                            Log.WriteWarning($"A benchmark didn't contain the expected result ('{exclude.Result}'), the exclusion will be ignored.");
+                        } 
+                        else 
+                        {
+                            var orderedResults = executionResults.OrderBy(x => x.JobResults.Jobs[exclude.Job].Results[exclude.Result]);
+                            var includedResults = executionResults.Skip(exclude.Low).SkipLast(exclude.High);
+                            var excludedresults = executionResults.Except(includedResults);
+
+                            Console.WriteLine($"Excluded values: {string.Join(", ", excludedresults.Select(x => x.JobResults.Jobs[exclude.Job].Results[exclude.Result]))}");
+                            Console.WriteLine($"Remaining values: {string.Join(", ", includedResults.Select(x => x.JobResults.Jobs[exclude.Job].Results[exclude.Result]))}");
+
+                            executionResults = includedResults.ToList();
+                        }                    
+                    }
+
+                    // Compute averages
+
                     executionResult = ComputeAverages(executionResults);
                     executionResults.Clear();
                     executionResults.Add(executionResult);
@@ -790,11 +915,14 @@ namespace Microsoft.Crank.Controller
 
                 // Save results
 
-                CleanMeasurements(jobResults);
-
-                if (_outputOption.HasValue())
+                if (i == iterations)
                 {
-                    var filename = _outputOption.Value();
+                    CleanMeasurements(jobResults);
+                }
+
+                if (_jsonOption.HasValue())
+                {
+                    var filename = _jsonOption.Value();
                     
                     var directory = Path.GetDirectoryName(filename);
                     if (!String.IsNullOrEmpty(directory) && !Directory.Exists(directory))
@@ -915,8 +1043,10 @@ namespace Microsoft.Crank.Controller
             
             if (!String.IsNullOrEmpty(job.Job.Error))
             {
-                Log.Write(job.Job.Error, notime: true, error: true);
+                Log.WriteError(job.Job.Error, notime: true);
             }
+
+            await job.DownloadDumpAsync();
 
             await job.DownloadTraceAsync();
 
@@ -934,10 +1064,10 @@ namespace Microsoft.Crank.Controller
 
             // Save results as a single file
 
-            if (_outputOption.HasValue())
+            if (_jsonOption.HasValue())
             {
-                var filename = _outputOption.Value();
-                
+                var filename = _jsonOption.Value();
+
                 var directory = Path.GetDirectoryName(filename);
                 if (!String.IsNullOrEmpty(directory) && !Directory.Exists(directory))
                 {
@@ -1107,15 +1237,16 @@ namespace Microsoft.Crank.Controller
 
                     CleanMeasurements(jobResults);
 
-                    if (_outputOption.HasValue())
+                    if (_jsonOption.HasValue())
                     {
-                        var filename = _outputOption.Value();
+                        var filename = _jsonOption.Value();
+
                         var index = 1;
 
                         do
                         {
-                            var filenameWithoutExtension = Path.GetFileNameWithoutExtension(_outputOption.Value());
-                            filename = filenameWithoutExtension + "-" + index++ + Path.GetExtension(_outputOption.Value());
+                            var filenameWithoutExtension = Path.GetFileNameWithoutExtension(filename);
+                            filename = filenameWithoutExtension + "-" + index++ + Path.GetExtension(filename);
                         } while (File.Exists(filename));
 
                         await File.WriteAllTextAsync(filename, JsonConvert.SerializeObject(jobResults, Formatting.Indented, new JsonSerializerSettings { ContractResolver = new CamelCasePropertyNamesContractResolver() }));
@@ -1142,8 +1273,10 @@ namespace Microsoft.Crank.Controller
 
             await job.TryUpdateJobAsync();
 
-            await job.DownloadTraceAsync();
+            await job.DownloadDumpAsync();
 
+            await job.DownloadTraceAsync();
+            
             await job.DownloadAssetsAsync(jobName);
 
             await job.DeleteAsync();
@@ -1184,7 +1317,8 @@ namespace Microsoft.Crank.Controller
             IEnumerable<KeyValuePair<string, string>> arguments,
             JObject commandLineVariables,
             IEnumerable<string> profiles,
-            IEnumerable<string> scripts
+            IEnumerable<string> scripts,
+            int interval
             )
         {
             JObject configuration = null;
@@ -1249,12 +1383,16 @@ namespace Microsoft.Crank.Controller
                 configurationInstance.Jobs[jobName] = new Job();
             }
 
+            // Pee-configuration
             foreach (var job in configurationInstance.Jobs)
             {
                 // Force all jobs as self-contained by default. This can be overrided by command line config.
                 // This can't be done in ServerJob for backward compatibility
                 job.Value.SelfContained = true;
 
+                // Update the job's interval based on the common config
+                job.Value.MeasurementsIntervalSec = interval;
+                
                 job.Value.Service = job.Key;
             }
 
@@ -1346,6 +1484,7 @@ namespace Microsoft.Crank.Controller
             foreach (JProperty property in configuration["Jobs"] ?? new JObject())
             {
                 var job = property.Value;
+
                 var rootVariables = configuration["Variables"] as JObject ?? new JObject();
                 var jobVariables = job["Variables"] as JObject ?? new JObject();
 
@@ -1354,11 +1493,10 @@ namespace Microsoft.Crank.Controller
                 // Apply templates on variables first
                 ApplyTemplates(variables, new TemplateContext { Model = variables.DeepClone() });
 
-                ApplyTemplates(job, new TemplateContext { Model = variables });
+                ApplyTemplates(job, new TemplateContext { Model = variables }.SetValue("job", job));
             }
 
             var result = configuration.ToObject<Configuration>();
-
 
             // Validates that the scripts defined in the command line exist
             foreach (var script in scripts)
@@ -1370,33 +1508,44 @@ namespace Microsoft.Crank.Controller
                 }
             }
 
-            // Jobs post configuration
-            foreach (var job in result.Jobs)
+            // Jobs post configuration for all jobs in the scenario
+
+            var dependencies = result.Scenarios[scenarioName].Select(x => x.Key).ToArray();
+
+            foreach (var jobName in dependencies)
             {
-                if (job.Value.OnConfigure != null && job.Value.OnConfigure.Any())
+                var job = result.Jobs[jobName];
+
+                if (job.OnConfigure != null && job.OnConfigure.Any())
                 {
                     var engine =  new Engine();
                     
-                    engine.SetValue("job", job.Value);
+                    engine.SetValue("job", job);
                     engine.SetValue("console", _scriptConsole);
 
-                    foreach(var script in job.Value.OnConfigure)
+                    foreach(var script in job.OnConfigure)
                     {
                         engine.Execute(script);
                     }                    
                 }
 
-                // If the job is a BenchmarkDotNet application, define default arguments so we can download the results as JSon
-                if (job.Value.Options.BenchmarkDotNet)
+                // Set default trace arguments if none is specified
+                if (job.Collect && String.IsNullOrEmpty(job.CollectArguments))
                 {
-                    job.Value.WaitForExit = true;
-                    job.Value.ReadyStateText ??= "BenchmarkRunner: Start";
-                    job.Value.Arguments = DefaultBenchmarkDotNetArguments + " " + job.Value.Arguments;
+                    job.CollectArguments = _defaultTraceArguments;
                 }
 
-                if (job.Value.Options.ReuseSource || job.Value.Options.ReuseBuild)
+                // If the job is a BenchmarkDotNet application, define default arguments so we can download the results as JSon
+                if (job.Options.BenchmarkDotNet)
                 {
-                    var source = job.Value.Source;
+                    job.WaitForExit = true;
+                    job.ReadyStateText ??= "BenchmarkRunner: Start";
+                    job.Arguments = DefaultBenchmarkDotNetArguments + " " + job.Arguments;
+                }
+
+                if (job.Options.ReuseSource || job.Options.ReuseBuild)
+                {
+                    var source = job.Source;
 
                     // Compute a custom source key
                     source.SourceKey = source.Repository
@@ -1412,32 +1561,44 @@ namespace Microsoft.Crank.Controller
                     using (var sha1 = SHA1.Create())  
                     {  
                         // Assume no collision since it's verified on the server
-                        var bytes = sha1.ComputeHash(Encoding.UTF8.GetBytes(job.Value.Source.SourceKey));
+                        var bytes = sha1.ComputeHash(Encoding.UTF8.GetBytes(job.Source.SourceKey));
                         source.SourceKey = String.Concat(bytes.Select(b => b.ToString("x2"))).Substring(0, 8);
                     }
 
-                    if (job.Value.Options.ReuseBuild)
+                    if (job.Options.ReuseBuild)
                     {
                         source.NoBuild = true;
                     }
                 }
 
-                if (job.Value.CollectCounters)
+                if (job.CollectCounters)
                 {
-                    Log.Write($"WARNING: '{job.Key}.collectCounters' has been deprecated, in the future please use '{job.Key}.options.collectCounters'.");
-                    job.Value.Options.CollectCounters = true;
+                    Log.WriteWarning($"WARNING: '{jobName}.collectCounters' has been deprecated, in the future please use '{jobName}.options.collectCounters'.");
+                    job.Options.CollectCounters = true;
                 }
 
                 // if CollectCounters is set and no provider are defined, use System.Runtime as the default provider
-                if (job.Value.Options.CollectCounters == true && !job.Value.Options.CounterProviders.Any())
+                if (job.Options.CollectCounters == true && !job.Options.CounterProviders.Any())
                 {
-                    job.Value.Options.CounterProviders.Add("System.Runtime");
+                    job.Options.CounterProviders.Add("System.Runtime");
+                }
+
+                if (!String.IsNullOrEmpty(job.Options.DumpType))
+                {
+                    if (!Enum.TryParse<DumpTypeOption>(job.Options.DumpType, ignoreCase: true, out var dumpType))
+                    {
+                        dumpType = DumpTypeOption.Mini;
+                        Log.WriteWarning($"WARNING: Invalid value for 'DumpType'. Using 'Mini'.");
+                    }
+
+                    job.DumpProcess = true;
+                    job.DumpType = dumpType;
                 }
 
                 // Copy the dotnet counters from the list of providers
-                if (job.Value.Options.CollectCounters != false && job.Value.Options.CounterProviders.Any())
+                if (job.Options.CollectCounters != false && job.Options.CounterProviders.Any())
                 {
-                    foreach (var provider in job.Value.Options.CounterProviders)
+                    foreach (var provider in job.Options.CounterProviders)
                     {
                         var allProviderSections = configurationInstance.Counters.Where(x => x.Provider.Equals(provider, StringComparison.OrdinalIgnoreCase));
 
@@ -1450,7 +1611,7 @@ namespace Microsoft.Crank.Controller
                         {
                             foreach (var counter in providerSection.Values)
                             {
-                                job.Value.Counters.Add(new DotnetCounter { Provider = providerSection.Provider, Name = counter.Name, Measurement = counter.Measurement });
+                                job.Counters.Add(new DotnetCounter { Provider = providerSection.Provider, Name = counter.Name, Measurement = counter.Measurement });
                             }
                         }
                     }
@@ -1459,6 +1620,7 @@ namespace Microsoft.Crank.Controller
 
             return result;
         }
+
         private static void ApplyTemplates(JToken node, TemplateContext templateContext)
         {
             foreach (var token in node.Children())
@@ -1565,7 +1727,7 @@ namespace Microsoft.Crank.Controller
                         if (!validationResults.IsValid)
                         {
                             // Create a json debug file with the schema
-                            localconfiguration.AddFirst(new JProperty("$schema", "https://raw.githubusercontent.com/dotnet/crank/master/src/Microsoft.Crank.Controller/benchmarks.schema.json"));
+                            localconfiguration.AddFirst(new JProperty("$schema", "https://raw.githubusercontent.com/dotnet/crank/main/src/Microsoft.Crank.Controller/benchmarks.schema.json"));
 
                             var debugFilename = Path.Combine(Path.GetTempPath(), "crank-debug.json");
                             File.WriteAllText(debugFilename, localconfiguration.ToString(Formatting.Indented));
@@ -1819,9 +1981,12 @@ namespace Microsoft.Crank.Controller
                 var jobResult = jobResults.Jobs[jobName] = new JobResult();
                 var jobConnections = jobsByDependency[jobName];
 
+                // Extract dependencies from the first job
+                jobResult.Dependencies = jobConnections.First().Job.Dependencies.ToArray();
+
                 // Calculate results from configuration and job metadata
 
-                var resultDefinitions = jobConnections[0].Job.Metadata.Select(x => 
+                var resultDefinitions = jobConnections.SelectMany(j => j.Job.Metadata.Select(x => 
                     new Result { 
                         Measurement = x .Name, 
                         Name = x.Name,
@@ -1830,7 +1995,7 @@ namespace Microsoft.Crank.Controller
                         Aggregate = x.Aggregate.ToString().ToLowerInvariant(),
                         Reduce = x.Reduce.ToString().ToLowerInvariant()
                         }
-                    ).GroupBy(x => x.Name).ToDictionary(x => x.Key, x => x.Last());
+                    )).GroupBy(x => x.Name).ToDictionary(x => x.Key, x => x.Last());
                 
                 // Update any result definition with the ones in the configuration
                 foreach (var result in configuration.Results)
@@ -1932,11 +2097,43 @@ namespace Microsoft.Crank.Controller
                 {
                     jobResult.Measurements.Clear();
                 }
+
+                // Duplicate multi key values (if the key contains ';') then it means the key is currently migrated 
+                // and it wants both keys to have the result for backward compatibility
+                foreach (var result in jobResult.Results.ToArray())
+                {
+                    if (result.Key.Contains(";"))
+                    {
+                        var keys = result.Key.Split(';', StringSplitOptions.RemoveEmptyEntries);
+                        
+                        foreach (var key in keys)
+                        {
+                            jobResult.Results[key] = result.Value;
+                        }
+
+                        jobResult.Results.Remove(result.Key);
+                    }
+                }
             }
         }
 
+        /// <summary>
+        /// Given a list of all the JobConnection for a named job (load for instance) aggregates all the measures of the same measurement for a job,
+        /// then reduces these values across jobs.
+        /// </summary>
         private static Dictionary<string, object> AggregateAndReduceResults(IEnumerable<JobConnection> jobs, Engine engine, List<Result> resultDefinitions)
         {
+            // resulDefinitions contains the list of all rules to apply to any measurement, e.g.:
+            //   {
+            //     "Measurement": "runtime-counter/time-in-gc",
+            //     "Name": "runtime-counter/time-in-gc",
+            //     "Description": "Max Time in GC (%)",
+            //     "Format": "n2",
+            //     "Aggregate": "max",
+            //     "Reduce": "max",
+            //     "Excluded": false
+            //   }
+
             if (jobs == null || !jobs.Any())
             {
                 return new Dictionary<string, object>();
@@ -2352,7 +2549,7 @@ namespace Microsoft.Crank.Controller
                 var metadata = job.Value.Metadata;
 
                 // When computing averages, we lose all measurements
-                var jobResult = new JobResult { Metadata = metadata };
+                var jobResult = new JobResult { Metadata = metadata, Dependencies = job.Value.Dependencies };
                 
                 jobResults.Jobs[jobName] = jobResult;
 

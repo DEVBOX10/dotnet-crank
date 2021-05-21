@@ -29,6 +29,9 @@ namespace Microsoft.Crank.Models
         /// </summary>
         public string RunId { get; set; } = Guid.NewGuid().ToString("n");
 
+        public string CrankArguments { get; set; }
+        public string Origin { get; set; }
+
         [JsonConverter(typeof(StringEnumConverter))]
         public Hardware? Hardware { get; set; }
 
@@ -60,7 +63,6 @@ namespace Microsoft.Crank.Models
         public string SdkVersion { get; set; } = "";
         public string UseMonoRuntime { get; set; } = "";
         public bool NoGlobalJson { get; set; }
-        public Database Database { get; set; } = Database.None;
 
         // Delay from the process started to the console receiving "Application started"
         public TimeSpan StartupMainMethod { get; set; }
@@ -95,6 +97,11 @@ namespace Microsoft.Crank.Models
         public bool DotNetTrace { get; set; }
         public string DotNetTraceProviders { get; set; }
 
+        // Dump
+        public bool DumpProcess { get; set; }
+        public DumpTypeOption DumpType { get; set; } = DumpTypeOption.Mini;
+        public string DumpFile { get; set; }
+
         // Perfview/Perfcollect
         public bool Collect { get; set; }
         public string CollectArguments { get; set; }
@@ -111,6 +118,11 @@ namespace Microsoft.Crank.Models
         
         // For backward compatibility. Use Options.CollectCounters instead
         public bool CollectCounters { get; set; }
+
+        /// <summary>
+        /// The expected interval for each recurring measurements (dotnet counters, custom measurements, ...)
+        /// </summary>
+        public int MeasurementsIntervalSec { get; set; } = 1;
         
         /// <summary>
         /// The list of performance counter providers to be collected. Defaults to <c>System.Runtime</c>.
@@ -120,6 +132,7 @@ namespace Microsoft.Crank.Models
         public int ProcessId { get; set; }
         public int ChildProcessId { get; set; }
         public Dictionary<string, string> EnvironmentVariables { get; set; } = new Dictionary<string, string>();
+        public Dictionary<string, string> PackageReferences { get; set; } = new Dictionary<string, string>();
         public List<string> BuildArguments { get; set; } = new List<string>();
         public bool NoClean { get; set; }
         public string Framework { get; set; }
@@ -196,6 +209,9 @@ namespace Microsoft.Crank.Models
         /// Script that is executed once the templates have been processed.
         public List<string> OnConfigure { get; set; } = new List<string>();
 
+        public List<Dependency> Dependencies { get; set; } = new List<Dependency>();
+
+        public bool CollectDependencies { get; set; }
     }
 
     /// <summary>
@@ -208,6 +224,7 @@ namespace Microsoft.Crank.Models
         public bool Fetch { get; set; }
         public string FetchOutput { get; set; }
         public List<string> DownloadFiles { get; set; } = new List<string>();
+        public string DownloadFilesOutput { get; set; }
         public string TraceOutput { get; set; }
         public bool DisplayBuild { get; set; }
         public string RequiredOperatingSystem { get; set; }
@@ -228,5 +245,10 @@ namespace Microsoft.Crank.Models
         // Don't clone if already cloned.
         // Can be used with floating versions.
         public bool ReuseSource { get; set; }
+
+        // Full, Heap, Mini
+        public string DumpType { get; set; }
+        public string DumpOutput { get; set; }
+
     }
 }

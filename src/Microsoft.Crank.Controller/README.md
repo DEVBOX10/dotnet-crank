@@ -1,4 +1,4 @@
-# ASP.NET Benchmark Driver
+# Crank Benchmarks Controller
 
 ## Usage
 
@@ -22,16 +22,17 @@ Options:
   
   --sql                                                          Connection string or environment variable name of the SQL Server Database to store results in.
   --table                                                        Table or environment variable name of the SQL Database to store results in.
-  --output <filename>                                            An optional filename to store the output document.
+  --json <filename>                                              Store the results as json ins the specified file.
   --no-metadata                                                  Don't record metadata in the stored document.
   --no-measurements                                              Don't record measurements in the stored document.
 
+  -m|--interval                                                  The measurements interval in seconds. Default is 1.
   -i|--iterations <n>                                            The number of times to repeat the jobs to get average results. By default the last job only is repeated, unless '--repeat' is set. 
-  -di|--display-iterations                                       Displays intermediate iterations results.
   --repeat <job>                                                 The job to repeat using the '--duration' or '--iterations' argument.
   --span <HH:mm:ss>                                              The duration while the job is repeated.
   --auto-flush                                                   Runs a single long-running job and flushes measurements automatically.
-
+  -x|--exclude                                                   Excludes the specified number of high and low results, e.g., 1, 1:0 (exclude the lowest), 0:3 (exclude the 3 highest)
+  -xo|--exclude-order                                            The result to use to detect the high and low results, e.g., 'load:wrk/rps/mean'
   --chart                                                        Renders a chart for multi-value results.
   --chart-type [bar (default) | hex]                             Type of chart to render. Values are 'bar' (default) or 'hex'
   --chart-scale [off (default)| auto]                            Scale for chart. Values are 'off' (default) or 'auto'. When scale is off, the min value starts at 0.
@@ -59,7 +60,8 @@ Options:
   --[JOB].buildArguments <argument>                                        An argument to pass to msbuild. Can be used multiple times to define multiple values.
   --[JOB].selfContained <true|false>                                       Whether to deploy the app as stand-alone. Default is false. Is is forced to 'true' if either runtimeVersion or aspnetVersion is defined as the SDK versions would be used otherwise.
   --[JOB].useMonoRuntime <jit|llvm-jit|llvm-aot>                           Use a specific mono runtime instead of the dotnet core runtime.
-  
+  --[JOB].packageReferences <package=version>                              A package reference to add to the csproj. Can be used multiple times to define multiple values.
+
   ## Docker options
 
   --[JOB].source.dockerFile                                                The local path to the Docker file, e.g., frameworks/Rust/actix/actix-raw.dockerfile
@@ -79,7 +81,10 @@ Options:
   --[JOB].options.counterProviders <provider>                              The name of a performance counter provider from which to collect. e.g., System.Runtime, Microsoft-AspNetCore-Server-Kestrel, Microsoft.AspNetCore.Hosting, Microsoft.AspNetCore.Http.Connections, Grpc.AspNetCore.Server, Grpc.Net.client, Npgsql
   --[JOB].collectStartup <true|false>                                      Whether to include the startup phase in the traces, i.e after the application is launched and before it is marked as ready. For a web application it means before it is ready to accept requests.
   --[JOB].collect <true|false>                                             Whether to collect native traces. Uses PerfView on Windows and Perf/PerfCollect on Linux.
-  --[JOB].collectArguments <arguments>                                     Native traces arguments, e.g., "BufferSizeMB=1024;CircularMB=1024;clrEvents=JITSymbols;kernelEvents=process+thread+ImageLoad+Profile"
+  --[JOB].collectArguments <arguments>                                     Native traces arguments, default is "BufferSizeMB=1024;CircularMB=4096;TplEvents=None", other suggested values: "BufferSizeMB=1024;CircularMB=4096;ThreadTime", "BufferSizeMB=1024;CircularMB=4096;GcOnly"
+  --[JOB].options.dumpType <full|heap|mini>                                The type of dump to collect.
+  --[JOB].options.dumpOutput <filename>                                    The name of the dump file. Can be a file prefix (app will add *.DATE*.zip) , or a specific name and no DATE* will be added e.g., c:\dumps\mydump
+  --[JOB].collectDependencies <true|false>                                 Whether to include the list of project dependencies in the results.
 
   ## Environment
 
@@ -97,38 +102,24 @@ Options:
   --[JOB].options.fetchOutput <filename>                                   The name of the fetched archive. Can be a file prefix (app will add *.DATE*.zip) , or a specific name (end in *.zip) and no DATE* will be added e.g., c:\publishedapps\myApp
   --[JOB].options.displayOutput <true|false>                               Whether to download and display the standard output of the benchmark.
   --[JOB].options.displayBuild <true|false>                                Whether to download and display the standard output of the build step (works for .NET and Docker).
+  --[JOB].options.downloadFiles <filename|pattern>                         The name of the file(s) to download.
+  --[JOB].options.downloadFilesOutput <path>                               A path where the files will be downloaded.
 
   ## Files
+
   --[JOB].options.buildFiles <filename>                                    Build files that will be copied before the application is built. Accepts globing patterns and recursive marker (**). Format is 'path[;destination]'. Path can be a URL. e.g., c:\images\mydockerimage.tar, c:\code\Program.cs. If provided, the destination needs to be a folder name, relative to the root source.
   --[JOB].options.outputFiles <filename>                                   Output files that will be copied in the final application folder. Accepts globing patterns and recursive marker (**). Format is 'path[;destination]'. Path can be a URL. e.g., c:\build\Microsoft.AspNetCore.Mvc.dll, c:\files\samples\picture.png;wwwroot\picture.png. If provided, the destination needs to be a folder name, relative to the root source.
-  --[JOB].options.reuseSource <true|false>                                  Reuse local or remote sources across benchmarks for the same source.
-  --[JOB].options.reuseBuild <true|false>                                   Reuse build files across benchmarks. Don't use with floating runtime versions.
+  --[JOB].options.reuseSource <true|false>                                 Reuse local or remote sources across benchmarks for the same source.
+  --[JOB].options.reuseBuild <true|false>                                  Reuse build files across benchmarks. Don't use with floating runtime versions.
 
   ## Timeouts
 
-  --[JOB].timeout                                                           Maximum duration in seconds of the job in seconds. Defaults to 0 (unlimited).
-  --[JOB].buildTimeout                                                      Maximum duration of the build phase. Defaults to 00:10:00 (10 minutes).
-  --[JOB].startTimeout                                                      Maximum duration of the start phase. Defaults to 00:03:00 (3 minutes).
-  --[JOB].collectTimeout                                                    Maximum duration of the collect phase. Defaults to 00:05:00 (5 minutes).
+  --[JOB].timeout                                                          Maximum duration the job in seconds. Defaults to 0 (unlimited).
+  --[JOB].buildTimeout                                                     Maximum duration of the build phase. Defaults to 00:10:00 (10 minutes).
+  --[JOB].startTimeout                                                     Maximum duration of the start phase. Defaults to 00:03:00 (3 minutes).
+  --[JOB].collectTimeout                                                   Maximum duration of the collect phase. Defaults to 00:05:00 (5 minutes).
 
-  ## Telemetry
+  ## Measurements
 
   --[JOB].options.discardResults <true|false>                              Whether to discard all the results from this job, for instance during a warmup job.
 
-  # Example
-
-  dotnet run --
-    --config ..\..\..\benchmarks.compose.json 
-    --scenario plaintext 
-
-    --application.endpoints http://asp-perf-lin:5001
-    --application.sdkversion 5.0.100-alpha1-015721 
-    --application.dotnetTrace true 
-    --application.options.collectCounters true
-
-    --load.endpoints http://asp-perf-win:5001 
-    --load.source.localFolder ..\..\..\..\PipeliningClient\ 
-    --load.source.project PipeliningClient.csproj 
-    --load.variables.warmup 0 
-    --load.variables.duration 5  
-    --variables preset-headers=none 

@@ -4,12 +4,13 @@
 
 using System;
 using System.Collections.Generic;
-using System.IO;
+using System.Diagnostics;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.Security;
 using System.Security.Cryptography.X509Certificates;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using McMaster.Extensions.CommandLineUtils;
@@ -33,6 +34,8 @@ namespace Microsoft.Crank.Jobs.HttpClient
         public static string CertPath { get; set; }
         public static string CertPassword { get; set; }
         public static X509Certificate2 Certificate { get; set; }
+        public static bool Quiet { get; set; }
+        public static string Format { get; set; }
 
         static async Task Main(string[] args)
         {
@@ -48,11 +51,17 @@ namespace Microsoft.Crank.Jobs.HttpClient
             var optionVersion = app.Option("-v|--version <1.0,1.1,2.0>", "HTTP version, e.g. \"2.0\". Default is 1.1", CommandOptionType.SingleValue);
             var optionCertPath = app.Option("-t|--cert <filepath>", "The path to a cert pfx file.", CommandOptionType.SingleValue);
             var optionCertPwd = app.Option("-p|--certpwd <password>", "The password for the cert pfx file.", CommandOptionType.SingleValue);
+            var optionFormat = app.Option("-f|--format <format>", "The format of the output, e.g., text, json. Default is text.", CommandOptionType.SingleValue);
+            var optionQuiet = app.Option("-q|--quiet", "When set, nothing is rendered on stsdout but the results.", CommandOptionType.NoValue);
 
             app.OnExecuteAsync(async cancellationToken =>
             {
-                Console.WriteLine("Http Client");
-                Console.WriteLine($"args: {string.Join(" ", args)}");
+                Quiet = optionQuiet.HasValue();
+
+                Log("Http Client");
+                Log($"args: {string.Join(" ", args)}");
+
+                Format = optionFormat.HasValue() ? optionFormat.Value() : "text";
 
                 ServerUrl = optionUrl.Value();
 
@@ -82,7 +91,7 @@ namespace Microsoft.Crank.Jobs.HttpClient
                         case "1.1" : Version = HttpVersion.Version11; break;
                         case "2.0" : Version = HttpVersion.Version20; break;
                         default:
-                            Console.WriteLine("Unkown HTTP version: {0}", optionVersion.Value());
+                            Log("Unkown HTTP version: {0}", optionVersion.Value());
                             break;
                     }
                 }
@@ -90,11 +99,11 @@ namespace Microsoft.Crank.Jobs.HttpClient
                 if (optionCertPath.HasValue())
                 {
                     CertPath = optionCertPath.Value();
-                    Console.WriteLine("CerPath: " + CertPath);
+                    Log("CerPath: " + CertPath);
                     CertPassword = optionCertPwd.Value();
                     if (CertPath.StartsWith("http", StringComparison.OrdinalIgnoreCase))
                     {
-                        Console.WriteLine($"Downloading cert from: {CertPath}");
+                        Log($"Downloading certificate: {CertPath}");
                         var httpClientHandler = new HttpClientHandler
                         {
                             ServerCertificateCustomValidationCallback = HttpClientHandler.DangerousAcceptAnyServerCertificateValidator,
@@ -104,13 +113,14 @@ namespace Microsoft.Crank.Jobs.HttpClient
                         var httpClient = new System.Net.Http.HttpClient(httpClientHandler);
                         var bytes = await httpClient.GetByteArrayAsync(CertPath);
                         Certificate = new X509Certificate2(bytes, CertPassword);
-                        Console.WriteLine("Cert Thumb: " + Certificate.Thumbprint);
                     }
                     else
                     {
-                        Console.WriteLine($"Using cert from: {CertPath}");
+                        Log($"Reading certificate: {CertPath}");
                         Certificate = new X509Certificate2(CertPath, CertPassword);
                     }
+
+                    Log("Certificate Thumbprint: " + Certificate.Thumbprint);
                 }
 
                 await RunAsync();
@@ -119,9 +129,24 @@ namespace Microsoft.Crank.Jobs.HttpClient
             await app.ExecuteAsync(args);
         }
 
+        public static void Log()
+        {
+            Log("");
+        }
+
+        public static void Log(string message, params object[] args)
+        {
+            if (Quiet)
+            {
+                return;
+            }
+
+            Console.WriteLine(message, args);
+        }
+
         public static async Task RunAsync()
         {
-            Console.WriteLine($"Running {ExecutionTimeSeconds}s test @ {ServerUrl}");
+            Log($"Running {ExecutionTimeSeconds}s test @ {ServerUrl}");
 
             DateTime startTime = default, stopTime = default;
 
@@ -133,11 +158,15 @@ namespace Microsoft.Crank.Jobs.HttpClient
                     {
                         if (WarmupTimeSeconds > 0)
                         {
-                            Console.WriteLine($"Warming up for {WarmupTimeSeconds}s...");
+                            Log($"Warming up for {WarmupTimeSeconds}s...");
                             await Task.Delay(TimeSpan.FromSeconds(WarmupTimeSeconds));
                         }
+                        else
+                        {
+                            Log($"Warmup skipped");
+                        }
 
-                        Console.WriteLine($"Running for {ExecutionTimeSeconds}s...");
+                        Log($"Running for {ExecutionTimeSeconds}s...");
 
                         _measuring = true;
 
@@ -147,11 +176,9 @@ namespace Microsoft.Crank.Jobs.HttpClient
                         {
                             await Task.Delay(1000);
 
-                            Console.Write(".");
-
                         } while (_running);
 
-                        Console.WriteLine();
+                        Log();
                     });
 
                 // Shutdown everything
@@ -162,10 +189,17 @@ namespace Microsoft.Crank.Jobs.HttpClient
 
                        _running = false;
 
-                       Console.WriteLine($"Stopping...");
+                       Log($"Stopping...");
 
                        stopTime = DateTime.UtcNow;
                    });
+            }
+
+            if (ExecutionTimeSeconds <= 0)
+            {
+                Log($"Benchmark skipped");
+
+                return;
             }
 
             _running = true;
@@ -179,7 +213,7 @@ namespace Microsoft.Crank.Jobs.HttpClient
 
             await Task.WhenAll(workerTasks);
 
-            Console.WriteLine($"Stopped...");
+            Log($"Stopped...");
 
             var result = new WorkerResult
             {
@@ -188,38 +222,53 @@ namespace Microsoft.Crank.Jobs.HttpClient
                 Status3xx = workerTasks.Select(x => x.Result.Status3xx).Sum(),
                 Status4xx = workerTasks.Select(x => x.Result.Status4xx).Sum(),
                 Status5xx = workerTasks.Select(x => x.Result.Status5xx).Sum(),
-                SocketErrors = workerTasks.Select(x => x.Result.SocketErrors).Sum()
+                SocketErrors = workerTasks.Select(x => x.Result.SocketErrors).Sum(),
+                Stopped = stopTime.ToLocalTime(),
+                Started = startTime.ToLocalTime(),
+                ThroughputBps = workerTasks.Select(x => x.Result.ThroughputBps).Sum(),
+                LatencyMaxMs = Math.Round(workerTasks.Select(x => x.Result.LatencyMaxMs).Max(), 3),
+                LatencyMeanMs = workerTasks.Select(x => x.Result.TotalRequests).Sum() == 0 ? 0 : Math.Round((stopTime - startTime).TotalMilliseconds / workerTasks.Select(x => x.Result.TotalRequests).Sum(), 3),
+                Connections = Connections,
             };
 
             var totalTps = (int)((result.Status1xx + result.Status2xx + result.Status3xx + result.Status4xx + result.Status5xx ) / (stopTime - startTime).TotalSeconds);
 
-            Console.WriteLine($"Average RPS:     {totalTps:N0}");
-            Console.WriteLine($"1xx:             {result.Status1xx:N0}");
-            Console.WriteLine($"2xx:             {result.Status2xx:N0}");
-            Console.WriteLine($"3xx:             {result.Status3xx:N0}");
-            Console.WriteLine($"4xx:             {result.Status4xx:N0}");
-            Console.WriteLine($"5xx:             {result.Status5xx:N0}");
-            Console.WriteLine($"Socket Errors:   {result.SocketErrors:N0}");
+            if (Format == "text")
+            {
+                Console.WriteLine($"Average RPS:       {totalTps:N0}");
+                Console.WriteLine($"1xx:               {result.Status1xx:N0}");
+                Console.WriteLine($"2xx:               {result.Status2xx:N0}");
+                Console.WriteLine($"3xx:               {result.Status3xx:N0}");
+                Console.WriteLine($"4xx:               {result.Status4xx:N0}");
+                Console.WriteLine($"5xx:               {result.Status5xx:N0}");
+                Console.WriteLine($"Socket Errors:     {result.SocketErrors:N0}");
+                Console.WriteLine($"Total requests:    {result.TotalRequests:N0}");
+                Console.WriteLine($"Latency mean (ms): {result.LatencyMeanMs:N3}");
+                Console.WriteLine($"Latency max (ms):  {result.LatencyMaxMs:N3}");
+                Console.WriteLine($"Throughput (MB/s): {(double)result.ThroughputBps / 1024 / 1024:N3}");
+            }
+            else if (Format == "json")
+            {
+                Console.WriteLine(JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true, PropertyNamingPolicy = JsonNamingPolicy.CamelCase }));
+            }
 
             // If multiple samples are provided, take the max RPS, then sum the result from all clients
-            BenchmarksEventSource.Register("httpclient/connections", Operations.Max, Operations.Sum, "Connections", "Number of active connections", "n0");
-            BenchmarksEventSource.Register("httpclient/badresponses", Operations.Max, Operations.Sum, "Bad responses", "Non-2xx or 3xx responses", "n0");
-            BenchmarksEventSource.Register("httpclient/latency/mean", Operations.Max, Operations.Sum, "Mean latency (us)", "Mean latency (us)", "n0");
-            BenchmarksEventSource.Register("httpclient/latency/max", Operations.Max, Operations.Sum, "Max latency (us)", "Max latency (us)", "n0");
-            BenchmarksEventSource.Register("httpclient/requests", Operations.Max, Operations.Sum, "Requests", "Total number of requests", "n0");
-            BenchmarksEventSource.Register("httpclient/rps/mean", Operations.Max, Operations.Sum, "Requests/sec", "Requests per second", "n0");
-            BenchmarksEventSource.Register("httpclient/throughput", Operations.Max, Operations.Sum, "Read throughput (MB/s)", "Read throughput (MB/s)", "n2");
-            BenchmarksEventSource.Register("httpclient/errors", Operations.Sum, Operations.Sum, "Socket Errors", "Socket Errors", "n0");
+            BenchmarksEventSource.Register("httpclient/badresponses;http/requests/badresponses", Operations.Max, Operations.Sum, "Bad responses", "Non-2xx or 3xx responses", "n0");
+            BenchmarksEventSource.Register("httpclient/latency/mean;http/latency/mean", Operations.Max, Operations.Avg, "Mean latency (us)", "Mean latency (us)", "n0");
+            BenchmarksEventSource.Register("httpclient/latency/max;http/latency/max", Operations.Max, Operations.Max, "Max latency (us)", "Max latency (us)", "n0");
+            BenchmarksEventSource.Register("httpclient/requests;http/requests", Operations.Max, Operations.Sum, "Requests", "Total number of requests", "n0");
+            BenchmarksEventSource.Register("httpclient/rps/mean;http/rps/mean", Operations.Max, Operations.Sum, "Requests/sec", "Requests per second", "n0");
+            BenchmarksEventSource.Register("httpclient/throughput;http/throughput", Operations.Max, Operations.Sum, "Read throughput (MB/s)", "Read throughput (MB/s)", "n2");
+            BenchmarksEventSource.Register("httpclient/errors;http/requests/errors", Operations.Sum, Operations.Sum, "Socket Errors", "Socket Errors", "n0");
 
-            BenchmarksEventSource.Measure("httpclient/rps/mean", totalTps);
-            BenchmarksEventSource.Measure("httpclient/connections", Connections);
-            BenchmarksEventSource.Measure("httpclient/requests", result.Status1xx + result.Status2xx + result.Status3xx + result.Status4xx + result.Status5xx + result.SocketErrors);
-            BenchmarksEventSource.Measure("httpclient/badresponses", result.Status1xx + result.Status4xx + result.Status5xx);
-            BenchmarksEventSource.Measure("httpclient/errors", result.SocketErrors);
+            BenchmarksEventSource.Measure("httpclient/rps/mean;http/rps/mean", totalTps);
+            BenchmarksEventSource.Measure("httpclient/requests;http/requests", result.Status1xx + result.Status2xx + result.Status3xx + result.Status4xx + result.Status5xx + result.SocketErrors);
+            BenchmarksEventSource.Measure("httpclient/badresponses;http/requests/badresponses", result.Status1xx + result.Status4xx + result.Status5xx);
+            BenchmarksEventSource.Measure("httpclient/errors;http/requests/errors", result.SocketErrors);
 
-            BenchmarksEventSource.Measure("httpclient/latency/mean", 0);
-            BenchmarksEventSource.Measure("httpclient/latency/max", 0);
-            BenchmarksEventSource.Measure("httpclient/throughput", 0);
+            BenchmarksEventSource.Measure("httpclient/latency/mean;http/latency/mean", result.LatencyMeanMs);
+            BenchmarksEventSource.Measure("httpclient/latency/max;http/latency/max", result.LatencyMaxMs);
+            BenchmarksEventSource.Measure("httpclient/throughput;http/throughput", (double)result.ThroughputBps / 1024 / 1024);
         }
 
         private static HttpMessageInvoker CreateHttpMessageInvoker()
@@ -228,32 +277,35 @@ namespace Microsoft.Crank.Jobs.HttpClient
             {
                 lock (_synLock)
                 {
-                    var httpHandler = new SocketsHttpHandler
+                    if (_httpMessageInvoker == null)
                     {
-                        // There should be only as many connections as Tasks concurrently, so there is no need
-                        // to limit the max connections per server 
-                        // httpHandler.MaxConnectionsPerServer = Connections;
-                        AllowAutoRedirect = false,
-                        UseProxy = false,
-                        AutomaticDecompression = System.Net.DecompressionMethods.None
-                    };
-                    // Accept any SSL certificate
-                    httpHandler.SslOptions.RemoteCertificateValidationCallback += (object sender, X509Certificate certificate, X509Chain chain, SslPolicyErrors sslPolicyErrors) => true;
-
-                    if (Certificate != null)
-                    {
-                        Console.WriteLine($"Using Cert");
-                        httpHandler.SslOptions.ClientCertificates = new X509CertificateCollection
+                        var httpHandler = new SocketsHttpHandler
                         {
-                            Certificate
+                            // There should be only as many connections as Tasks concurrently, so there is no need
+                            // to limit the max connections per server 
+                            // httpHandler.MaxConnectionsPerServer = Connections;
+                            AllowAutoRedirect = false,
+                            UseProxy = false,
+                            AutomaticDecompression = System.Net.DecompressionMethods.None
                         };
-                    }
-                    else
-                    {
-                        Console.WriteLine($"No cert specified.");
-                    }
+                        // Accept any SSL certificate
+                        httpHandler.SslOptions.RemoteCertificateValidationCallback += (object sender, X509Certificate certificate, X509Chain chain, SslPolicyErrors sslPolicyErrors) => true;
 
-                    _httpMessageInvoker = new HttpMessageInvoker(httpHandler);
+                        if (Certificate != null)
+                        {
+                            Log($"Using Cert");
+                            httpHandler.SslOptions.ClientCertificates = new X509CertificateCollection
+                            {
+                                Certificate
+                            };
+                        }
+                        else
+                        {
+                            Log($"No cert specified.");
+                        }
+
+                        _httpMessageInvoker = new HttpMessageInvoker(httpHandler);
+                    }
                 }
             }
 
@@ -285,22 +337,30 @@ namespace Microsoft.Crank.Jobs.HttpClient
             // Counters local to this worker
             var counters = new int[5];
             var socketErrors = 0;
-
-            // var sw = new Stopwatch();
+            var maxLatency = 0D;
+            var transferred = 0L;
+            var measuringStart = 0L;
+            var sw = new Stopwatch();
+            sw.Start();
 
             while (_running)
             {
                 try
                 {
-                    // sw.Start();
-
+                    var start = sw.ElapsedTicks;
                     using var responseMessage = await httpMessageInvoker.SendAsync(requestMessage, CancellationToken.None);
-
-                    // sw.Stop();
-                    // Add the latency divided by the pipeline depth
-
+                    
                     if (_measuring)
                     {
+                        if (measuringStart == 0)
+                        {
+                            measuringStart = sw.ElapsedTicks;
+                        }
+
+                        transferred += responseMessage.Content.Headers.ContentLength ?? 0;
+                        var latency = sw.ElapsedTicks - start;
+                        maxLatency = Math.Max(maxLatency, latency);
+
                         var status = (int)responseMessage.StatusCode;
 
                         if (status < 100 && status >= 600)
@@ -320,6 +380,8 @@ namespace Microsoft.Crank.Jobs.HttpClient
                 }
             }
 
+            var throughput = transferred / ((sw.ElapsedTicks - measuringStart) / Stopwatch.Frequency);
+
             return new WorkerResult
             {
                 Status1xx = counters[0],
@@ -327,7 +389,9 @@ namespace Microsoft.Crank.Jobs.HttpClient
                 Status3xx = counters[2],
                 Status4xx = counters[3],
                 Status5xx = counters[4],
-                SocketErrors = socketErrors
+                SocketErrors = socketErrors,
+                LatencyMaxMs = maxLatency / Stopwatch.Frequency * 1000,
+                ThroughputBps = throughput
             };
         }
     }

@@ -1,5 +1,5 @@
 # FROM mcr.microsoft.com/dotnet/sdk:5.0 as build-env
-FROM mcr.microsoft.com/dotnet/sdk:5.0.102-ca-patch-buster-slim as build-env
+FROM mcr.microsoft.com/dotnet/sdk:5.0.201 as build-env
 
 COPY . .
 
@@ -12,9 +12,14 @@ RUN dotnet publish -c Release src/Microsoft.Crank.Agent --output /app
 
 # Build runtime image
 # FROM mcr.microsoft.com/dotnet/aspnet:5.0
-FROM mcr.microsoft.com/dotnet/sdk:5.0.102-ca-patch-buster-slim
+# Use SDK image as it is required for the dotnet tools
+FROM mcr.microsoft.com/dotnet/sdk:5.0.201
 
 ARG CPUNAME=x86_64
+
+# Install dotnet-symbols
+RUN dotnet tool install -g dotnet-symbol
+ENV PATH="${PATH}:/root/.dotnet/tools"
 
 # Install dependencies
 RUN apt-get update \
@@ -23,7 +28,9 @@ RUN apt-get update \
         procps \
         cgroup-bin \
         curl \
-        wget
+        wget \
+        # dotnet performance repo microbenchmark dependencies
+        libgdiplus 
 
 # Build and install h2load. Required as there isn't a way to distribute h2load as a single file to download
 RUN apt-get update \
@@ -63,8 +70,8 @@ RUN apt-get update \
 
 RUN cp /usr/bin/perf_4.19 /usr/bin/perf
 
-# Downloading perfcollect - This branch contains SIGINT fixes
-ADD https://raw.githubusercontent.com/sebastienros/perfview/sebros/sigint/src/perfcollect/perfcollect /usr/bin/perfcollect
+# Downloading perfcollect
+ADD https://raw.githubusercontent.com/microsoft/perfview/main/src/perfcollect/perfcollect /usr/bin/perfcollect
 
 RUN chmod +x /usr/bin/perfcollect
 

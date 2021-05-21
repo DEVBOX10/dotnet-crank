@@ -16,6 +16,7 @@ using Microsoft.Crank.Models;
 using Microsoft.Crank.Controller.Ignore;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using System.Threading;
 
 namespace Microsoft.Crank.Controller
 {
@@ -37,6 +38,7 @@ namespace Microsoft.Crank.Controller
         private bool _keepAlive;
         private DateTime? _runningUtc;
         private string _jobName;
+        private bool _traceCollected;
 
         private int _outputCursor;
         private int _buildCursor;
@@ -49,6 +51,7 @@ namespace Microsoft.Crank.Controller
             _httpClientHandler.AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate;
 
             _httpClient = new HttpClient(_httpClientHandler);
+            _httpClient.Timeout = Timeout.InfiniteTimeSpan;
         }
 
         public JobConnection(Job definition, Uri serverUri)
@@ -132,7 +135,7 @@ namespace Microsoft.Crank.Controller
 
                 if (Job.State == JobState.Initializing)
                 {
-                    Log.Write($"Job has been selected by the server ...");
+                    Log.Write($"'{_jobName}' has been selected by the server ...");
 
                     // Start the keep-alive loop before uploading any file as slow networks could otherwise
                     // trigger driver timeouts
@@ -280,6 +283,14 @@ namespace Microsoft.Crank.Controller
                             var shouldSearchRecursively = outputFileSegments[0].Contains("**");
                             outputFileSegments[0] = outputFileSegments[0].Replace("**\\", "").Replace("**/", "");
 
+                            var someFilesWereUploaded = false;
+
+                            // If the argument doesn't contain a folder, it can fail the next statement, so assume it's using the local folder
+                            if (Path.GetDirectoryName(outputFileSegments[0]) == String.Empty)
+                            {
+                                outputFileSegments[0] = Path.Combine(".", outputFileSegments[0]);
+                            }
+
                             foreach (var resolvedFile in Directory.GetFiles(Path.GetDirectoryName(outputFileSegments[0]), Path.GetFileName(outputFileSegments[0]), shouldSearchRecursively ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly))
                             {
                                 var resolvedFileWithDestination = resolvedFile;
@@ -295,6 +306,13 @@ namespace Microsoft.Crank.Controller
                                 {
                                     throw new Exception("Error while uploading output files");
                                 }
+                                
+                                someFilesWereUploaded = true;
+                            }
+
+                            if (!someFilesWereUploaded)
+                            {
+                                Log.WriteWarning($"The argument '{outputFileSegments[0]}' didn't match any existing file.");
                             }
                         }
                     }
@@ -304,7 +322,7 @@ namespace Microsoft.Crank.Controller
                     Log.Verbose($"{(int)response.StatusCode} {response.StatusCode}");
                     response.EnsureSuccessStatusCode();
 
-                    Log.Write($"Job is now building ... {_serverJobUri}/buildlog");
+                    Log.Write($"'{_jobName}' is now building ... {_serverJobUri}/buildlog");
 
                     break;
                 }
@@ -331,7 +349,7 @@ namespace Microsoft.Crank.Controller
                 {
                     if (previouState != JobState.Running)
                     {
-                        Log.Write($"Job is running ... {_serverJobUri}/output");
+                        Log.Write($"'{_jobName}' is running ... {_serverJobUri}/output");
                         _runningUtc = DateTime.UtcNow;
                     }
 
@@ -339,12 +357,12 @@ namespace Microsoft.Crank.Controller
                 }
                 else if (currentState == JobState.Failed)
                 {
-                    Log.Write($"Job failed on benchmark server, stopping...");
+                    Log.Write($"'{_jobName}' failed on agent, stopping...");
 
                     // Refreshing Job state to display the error
                     Job = await GetJobAsync();
 
-                    Log.Write(Job.Error, notime: true, error: true);
+                    Log.WriteError(Job.Error, notime: true);
 
                     // Returning will also send a Delete message to the server
                     return null;
@@ -356,7 +374,7 @@ namespace Microsoft.Crank.Controller
                 }
                 else if (currentState == JobState.Stopped)
                 {
-                    Log.Write($"Job finished");
+                    Log.Write($"'{_jobName}' finished");
 
                     // If there is no ReadyStateText defined, the server will never be in Running state
                     // and we'll reach the Stopped state eventually, but that's a normal behavior.
@@ -490,28 +508,48 @@ namespace Microsoft.Crank.Controller
         /// </summary>
         public async Task<JobState> GetStateAsync()
         {
-            Log.Verbose($"GET {_serverJobUri}/state...");
-            var response = await _httpClient.GetAsync(_serverJobUri + "/state");
-            var responseContent = await response.Content.ReadAsStringAsync();
+            var delays = new[] { 100, 500, 1000 };
 
-            Log.Verbose($"{(int)response.StatusCode} {response.StatusCode} {responseContent}");
+            for (var i = 0; i < delays.Length; i++)
+            {
+                HttpResponseMessage response;
+                string responseContent;
 
-            if (response.StatusCode == HttpStatusCode.NotFound || String.IsNullOrEmpty(responseContent))
-            {
-                return JobState.Failed;
-            }
-            else
-            {
                 try
                 {
-                    return Enum.Parse<JobState>(responseContent);
+                    Log.Verbose($"GET {_serverJobUri}/state...");
+                    response = await _httpClient.GetAsync(_serverJobUri + "/state");
+                    responseContent = await response.Content.ReadAsStringAsync();
                 }
                 catch
                 {
-                    Log.Write($"ERROR while reading state on {_serverJobUri}");
+                    Log.Verbose($"Retrying ({i+1})");
+                    await Task.Delay(delays[i]);
+                    continue;
+                }
+
+                Log.Verbose($"{(int)response.StatusCode} {response.StatusCode} {responseContent}");
+
+                if (response.StatusCode == HttpStatusCode.NotFound || String.IsNullOrEmpty(responseContent))
+                {
                     return JobState.Failed;
                 }
+                else
+                {
+                    try
+                    {
+                        return Enum.Parse<JobState>(responseContent);
+                    }
+                    catch
+                    {
+                        Log.Write($"ERROR while reading state on {_serverJobUri}");
+                        return JobState.Failed;
+                    }
+                }
             }
+
+            Log.Write($"ERROR while getting state on {_serverJobUri}");
+            return JobState.Failed;
         }
 
         /// <summary>
@@ -534,23 +572,23 @@ namespace Microsoft.Crank.Controller
                     {
                         // Ping server job to keep it alive
                         Log.Verbose($"GET {_serverJobUri}/touch...");
-                        var response = await _httpClient.GetAsync(_serverJobUri + "/touch");
+                        var response = await _httpClient.GetAsync(_serverJobUri + "/touch", new CancellationTokenSource(2000).Token);
 
                         // Detect if the job has timed out. This doesn't account for any other service
                         if (Job.Timeout > 0 && _runningUtc != null && DateTime.UtcNow - _runningUtc > TimeSpan.FromSeconds(Job.Timeout))
                         {
-                            Log.Write($"Job has timed out, stopping...");
+                            Log.Write($"'{_jobName}' has timed out, stopping...");
                             await StopAsync();
                         }
+
+                        await Task.Delay(2000);
                     }
                     catch (Exception e)
                     {
-                        Log.Write($"Could not ping the server, retrying ...");
+                        Log.Write($"Could not ping the agent on '{_serverUri.Host}:{_serverUri.Port}', retrying ...");
                         Log.Verbose(e.ToString());
-                    }
-                    finally
-                    {
-                        await Task.Delay(2000);
+
+                        await Task.Delay(100);
                     }
                 }
             });
@@ -637,44 +675,118 @@ namespace Microsoft.Crank.Controller
                     traceDestination = traceDestination + "." + DateTime.Now.ToString("MM-dd-HH-mm-ss") + traceExtension;
                 }
 
-                Log.Write($"Collecting trace file, this can take several seconds");
-
-                var uri = _serverJobUri + "/trace";
-                var response = await _httpClient.PostAsync(uri, new StringContent(""));
-                response.EnsureSuccessStatusCode();
-
-                while (true)
-                {
-                    var state = await GetStateAsync();
-
-                    if (state == JobState.TraceCollecting)
-                    {
-                        Console.Write(".");
-                    }
-                    else
-                    {
-                        break;
-                    }
-
-                    await Task.Delay(1000);
-                }
-
-                Console.WriteLine();
+                await CollectTracesAsync();
 
                 Log.Write($"Downloading trace file {traceDestination} ...");
 
                 try
                 {
+                    StartKeepAlive();
+                    var uri = _serverJobUri + "/trace";
                     await _httpClient.DownloadFileWithProgressAsync(uri, _serverJobUri, traceDestination);
                 }
                 catch (Exception e)
                 {
                     Log.Write($"The trace was not captured on the server: " + e.ToString());
                 }
+                finally
+                {
+                    StopKeepAlive();
+                }
+
+
+                _traceCollected = true;
             }
             catch (Exception e)
             {
-                Log.Write($"Error while fetching trace for '{Job.Service}'");
+                Log.WriteWarning($"Error while fetching trace for '{Job.Service}'");
+                Log.Verbose(e.Message);
+            }
+        }
+
+        private async Task CollectTracesAsync()
+        {
+            if (_traceCollected)
+            {
+                return;
+            }
+
+            Log.Write($"Server is collecting trace file, this can take up to 1 minute");
+
+            var uri = _serverJobUri + "/trace";
+            var response = await _httpClient.PostAsync(uri, new StringContent(""));
+            response.EnsureSuccessStatusCode();
+
+            while (true)
+            {
+                var state = await GetStateAsync();
+
+                if (state == JobState.TraceCollecting)
+                {
+                    Console.Write(".");
+                }
+                else
+                {
+                    break;
+                }
+
+                await Task.Delay(1000);
+            }
+
+            Console.WriteLine();
+
+            _traceCollected = true;
+        }
+
+        public async Task DownloadDumpAsync()
+        {
+            if (!Job.DumpProcess)
+            {
+                return;
+            }
+
+            // We can only download the dump for a job that has been stopped
+            if (await GetStateAsync() != JobState.Stopped)
+            {
+                return;
+            }
+
+            try
+            {
+                var dumpExtension = ".dmp";
+
+                var dumpDestination = Job.Options.DumpOutput;
+
+                if (String.IsNullOrWhiteSpace(dumpDestination))
+                {
+                    dumpDestination = Job.Service;
+                }
+
+                if (!dumpDestination.EndsWith(dumpExtension, StringComparison.OrdinalIgnoreCase))
+                {
+                    dumpDestination = dumpDestination + "." + DateTime.Now.ToString("MM-dd-HH-mm-ss") + dumpExtension;
+                }
+
+                Log.Write($"Downloading dump file {dumpDestination} ...");
+
+                try
+                {
+                    StartKeepAlive();
+                    var uri = _serverJobUri + "/dump";
+                    await _httpClient.DownloadFileWithProgressAsync(uri, _serverJobUri, dumpDestination);
+                }
+                catch (Exception e)
+                {
+                    Log.Write($"The dump was not captured on the server: " + e.ToString());
+                }
+                finally
+                {
+                    StopKeepAlive();
+                }
+            }
+            catch (Exception e)
+            {
+                Log.WriteWarning($"Error while fetching dump for '{Job.Service}'");
                 Log.Verbose(e.Message);
             }
         }
@@ -701,7 +813,15 @@ namespace Microsoft.Crank.Controller
 
                     Log.Write($"Creating published assets '{fetchDestination}' ...");
 
-                    await FetchAsync(fetchDestination);
+                    try
+                    {
+                        StartKeepAlive();
+                        await _httpClient.DownloadFileWithProgressAsync(_serverJobUri + "/fetch", _serverJobUri, fetchDestination);
+                    }
+                    finally
+                    {
+                        StopKeepAlive();
+                    }
                 }
                 catch (Exception e)
                 {
@@ -719,13 +839,18 @@ namespace Microsoft.Crank.Controller
 
                     try
                     {
-                        await DownloadFileAsync(file);
+                        StartKeepAlive();
+                        await DownloadFileAsync(file, Job.Options.DownloadFilesOutput);
                     }
                     catch (Exception e)
                     {
-                        Log.Write($"Error while downloading file {file}, skipping ...");
+                        Log.WriteError($"Error while downloading file {file}, skipping ...");
                         Log.Verbose(e.Message);
                         continue;
+                    }
+                    finally
+                    {
+                        StopKeepAlive();
                     }
                 }
             }
@@ -871,12 +996,6 @@ namespace Microsoft.Crank.Controller
             }
         }
 
-        public async Task FetchAsync(string fetchDestination)
-        {
-            var uri = _serverJobUri + "/fetch";
-            await File.WriteAllBytesAsync(fetchDestination, await _httpClient.GetByteArrayAsync(uri));
-        }
-
         public async Task<string> DownloadBuildLog()
         {
             var uri = _serverJobUri + "/buildlog";
@@ -931,19 +1050,49 @@ namespace Microsoft.Crank.Controller
             return await _httpClient.GetStringAsync(uri);
         }
 
-        public async Task DownloadFileAsync(string file)
+        public async Task DownloadFileAsync(string file, string output)
         {
-            var uri = _serverJobUri + "/download?path=" + HttpUtility.UrlEncode(file);
-            Log.Verbose("GET " + uri);
-
-            var filename = file;
-            var counter = 1;
-            while (File.Exists(filename))
+            // Is it a globing pattern or a single file?
+            // Don't process a filename without * with ListFilesAsync as is could match multiple files
+            if (file.Contains('*'))
             {
-                filename = Path.GetFileNameWithoutExtension(file) + counter++ + Path.GetExtension(file);
-            }
+                var files = await ListFilesAsync(file);
 
-            await _httpClient.DownloadFileAsync(uri, _serverJobUri, filename);
+                foreach (var f in files)
+                {
+                    var uri = _serverJobUri + "/download?path=" + HttpUtility.UrlEncode(f);
+                    Log.Verbose("GET " + uri);
+
+                    var filename = Path.Combine(output ?? "", Path.GetDirectoryName(file), f);
+                    filename = Path.GetFullPath(filename);
+
+                    if (!Directory.Exists(Path.GetDirectoryName(filename)))
+                    {
+                        Directory.CreateDirectory(Path.GetDirectoryName(filename));
+                    }
+
+                    Log.Write($"Downloading '{filename}'");
+
+                    await _httpClient.DownloadFileAsync(uri, _serverJobUri, filename);
+                }
+            }
+            else
+            {
+                var uri = _serverJobUri + "/download?path=" + HttpUtility.UrlEncode(file);
+                Log.Verbose("GET " + uri);
+
+                var filename = Path.Combine(output ?? "", file);
+                filename = Path.GetFullPath(filename);
+
+                if (!Directory.Exists(Path.GetDirectoryName(filename)))
+                {
+                    Directory.CreateDirectory(Path.GetDirectoryName(filename));
+                }
+
+                Log.Write($"Downloading '{filename}'");
+
+                await _httpClient.DownloadFileAsync(uri, _serverJobUri, filename);
+            }
         }
 
         public async Task<IEnumerable<string>> ListFilesAsync(string pattern)
