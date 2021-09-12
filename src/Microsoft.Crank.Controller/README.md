@@ -37,6 +37,7 @@ Options:
   --chart-type [bar (default) | hex]                             Type of chart to render. Values are 'bar' (default) or 'hex'
   --chart-scale [off (default)| auto]                            Scale for chart. Values are 'off' (default) or 'auto'. When scale is off, the min value starts at 0.
   --script [name]                                                Execute a named script available in the configuration files. Can be used multiple times.
+  --relay <connection_string>                                    Connection string or environment variable name of the Azure Relay namespace used to access the Crank Agent endpoints. e.g., 'Endpoint=sb://mynamespace.servicebus.windows.net;...', 'MY_AZURE_RELAY_ENV';
 
   These options are specific to a Job service named [JOB]
 
@@ -58,7 +59,7 @@ Options:
   --[JOB].noGlobalJson <true|false>                                        Whether to not emit any global.json file to force the .NET SDK version to use. Default is false, meaning whatever version of the .NET SDK is chosen, it will be set in a global.json file.
   --[JOB].framework <tfm>                                                  The framework version to use in case it can't be assumed from the .NET runtime version. e.g., netcoreapp3.1
   --[JOB].buildArguments <argument>                                        An argument to pass to msbuild. Can be used multiple times to define multiple values.
-  --[JOB].selfContained <true|false>                                       Whether to deploy the app as stand-alone. Default is false. Is is forced to 'true' if either runtimeVersion or aspnetVersion is defined as the SDK versions would be used otherwise.
+  --[JOB].selfContained <true|false>                                       Whether to deploy the app as stand-alone. Default is true.
   --[JOB].useMonoRuntime <jit|llvm-jit|llvm-aot>                           Use a specific mono runtime instead of the dotnet core runtime.
   --[JOB].packageReferences <package=version>                              A package reference to add to the csproj. Can be used multiple times to define multiple values.
 

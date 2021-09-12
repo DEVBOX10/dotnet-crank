@@ -39,6 +39,8 @@ using System.Reflection.PortableExecutable;
 using System.Reflection.Metadata;
 using System.Security.Cryptography;
 using System.Globalization;
+using Microsoft.Azure.Relay;
+using Microsoft.AspNetCore.Hosting.Server;
 
 namespace Microsoft.Crank.Agent
 {
@@ -81,8 +83,7 @@ namespace Microsoft.Crank.Agent
         //private static readonly string _latestDesktopApiUrl = "https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet5/nuget/v3/flat2/Microsoft.NetCore.App.Runtime.win-x64/index.json";
         //private static readonly string _releaseMetadata = "https://dotnetcli.blob.core.windows.net/dotnet/release-metadata/releases-index.json";
 
-        // aka.ms links currently broken: https://aka.ms/dotnet/net6/dev/Sdk/productCommit-win-x64.txt
-        private static readonly string _latestSdkVersionUrl = "https://dotnetcli.blob.core.windows.net/dotnet/Sdk/main/latest.version";
+        private static readonly string _latestSdkVersionUrl = "https://aka.ms/dotnet/6.0/daily/productCommit-win-x64.txt";
         
         private static readonly string _aspnetSdkVersionUrl = "https://raw.githubusercontent.com/dotnet/aspnetcore/main/global.json";
         private static readonly string[] _runtimeFeedUrls = new string[] {
@@ -130,6 +131,12 @@ namespace Microsoft.Crank.Agent
         public static Task _processJobsTask;
 
         private static string _startPerfviewArguments;
+
+        private static CommandOption
+            _relayConnectionStringOption,
+            _relayPathOption,
+            _relayEnableHttpOption
+            ;
 
         static Startup()
         {
@@ -209,6 +216,9 @@ namespace Microsoft.Crank.Agent
                 CommandOptionType.SingleValue);
             var dotnethomeOption = app.Option("--dotnethome", "Folder to reuse for sdk and runtime installs.",
                 CommandOptionType.SingleValue);
+            _relayConnectionStringOption = app.Option("--relay", "Connection string or environment variable name of the Azure Relay Hybrid Connection to listen to. e.g., Endpoint=sb://mynamespace.servicebus.windows.net;...", CommandOptionType.SingleValue);
+            _relayPathOption = app.Option("--relay-path", "The hybrid connection name used to bind this agent. If not set the --relay argument must contain 'EntityPath={name}'", CommandOptionType.SingleValue);
+            _relayEnableHttpOption = app.Option("--relay-enable-http", "Activates the HTTP port even if Azure Relay is used.", CommandOptionType.NoValue);
             var hardwareVersionOption = app.Option("--hardware-version", "Hardware version (e.g, D3V2, Z420, ...).  Required.",
                 CommandOptionType.SingleValue);
             var noCleanupOption = app.Option("--no-cleanup",
@@ -282,7 +292,7 @@ namespace Microsoft.Crank.Agent
 
         private static async Task<int> Run(string url, string hostname, string dockerHostname)
         {
-            var host = new WebHostBuilder()
+            var builder = new WebHostBuilder()
                     .UseKestrel()
                     .ConfigureKestrel(o => o.Limits.MaxRequestBodySize = (long)10 * 1024 * 1024 * 1024)
                     .UseStartup<Startup>()
@@ -291,8 +301,53 @@ namespace Microsoft.Crank.Agent
                     {
                         logging.SetMinimumLevel(LogLevel.Error);
                         logging.AddConsole();
-                    })
-                    .Build();
+                    });
+
+            if (_relayConnectionStringOption.HasValue())
+            {
+                builder.UseAzureRelay(options =>
+                {
+                    var relayConnectionString = _relayConnectionStringOption.Value();
+
+                    if (!String.IsNullOrEmpty(Environment.GetEnvironmentVariable(relayConnectionString)))
+                    {
+                        relayConnectionString = Environment.GetEnvironmentVariable(relayConnectionString);
+                    }
+
+                    var rcsb = new RelayConnectionStringBuilder(relayConnectionString);
+
+                    if (_relayPathOption.HasValue())
+                    {
+                        rcsb.EntityPath = _relayPathOption.Value();
+                    }
+
+                    options.UrlPrefixes.Add(rcsb.ToString());
+                });
+
+                if (_relayEnableHttpOption.HasValue())
+                {
+                    // Create an IServer instance that will handle both Azure Relay requests and standard HTTP ones.
+                    // MessagePump can't be used specifically as it's internal, so we need to recover it from the currently
+                    // registered services.
+
+                    var serverTypes = Array.Empty<Type>();
+
+                    builder.ConfigureServices(services =>
+                    {
+                        var descriptors = services.Where(x => x.Lifetime == ServiceLifetime.Singleton && typeof(IServer).IsAssignableFrom(x.ServiceType)).ToArray();
+
+                        foreach (var d in descriptors)
+                        {
+                            services.Remove(d);
+                            services.AddSingleton(d.ImplementationType);
+                        }
+
+                        services.AddSingleton<IServer>(s => new CompositeServer(descriptors.Select(d => s.GetService(d.ImplementationType) as IServer)));
+                    });
+                }
+            }
+
+            var host = builder.Build();
 
             var hostTask = host.RunAsync();
 
@@ -5309,7 +5364,7 @@ namespace Microsoft.Crank.Agent
             Log.WriteLine($"Checking requirements...");
 
             // Add a NuGet.config for the self-contained deployments to be able to find the runtime packages on the CI feeds
-            // This is not taken into account however if the source folder contains its own witha <clear /> statement as this one
+            // This is not taken into account however if the source folder contains its own with a <clear /> statement as this one
             // is defined in the root benchmarks agent folder.
 
             var rootNugetConfig = Path.Combine(_rootTempDir, "NuGet.Config");
