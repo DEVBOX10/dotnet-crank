@@ -6,41 +6,40 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Diagnostics.Tracing;
+using System.Globalization;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Net.Sockets;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Xml.Linq;
 using System.Xml.XPath;
-using Microsoft.Crank.Models;
-using BenchmarksServer;
 using McMaster.Extensions.CommandLineUtils;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Hosting.Server;
+using Microsoft.AspNetCore.Hosting.WindowsServices;
+using Microsoft.Azure.Relay;
+using Microsoft.Crank.Models;
+using Microsoft.Diagnostics.NETCore.Client;
 using Microsoft.Diagnostics.Tools.Trace;
 using Microsoft.Diagnostics.Tracing;
-using Microsoft.Diagnostics.NETCore.Client;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
-using Repository;
-using OperatingSystem = Microsoft.Crank.Models.OperatingSystem;
 using NuGet.Versioning;
-using System.Net;
-using System.Reflection.PortableExecutable;
-using System.Reflection.Metadata;
-using System.Security.Cryptography;
-using System.Globalization;
-using Microsoft.Azure.Relay;
-using Microsoft.AspNetCore.Hosting.Server;
+using Repository;
+using Vanara.PInvoke;
+using OperatingSystem = Microsoft.Crank.Models.OperatingSystem;
 
 namespace Microsoft.Crank.Agent
 {
@@ -62,8 +61,8 @@ namespace Microsoft.Crank.Agent
             Based on the target framework
          */
 
-        private static string DefaultTargetFramework = "net6.0";
-        private static string DefaultChannel = "current";
+        private static readonly string DefaultTargetFramework = "net6.0";
+        private static readonly string DefaultChannel = "current";
 
         private const string PerfViewVersion = "P2.0.68";
 
@@ -95,11 +94,11 @@ namespace Microsoft.Crank.Agent
             "https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet-public/nuget/v3/flat2" };
 
         // Cached lists of SDKs and runtimes already installed
-        private static readonly HashSet<string> _installedAspNetRuntimes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        private static readonly HashSet<string> _installedDotnetRuntimes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        private static readonly HashSet<string> _installedDesktopRuntimes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        private static readonly HashSet<string> _ignoredDesktopRuntimes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        private static readonly HashSet<string> _installedSdks = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private static readonly HashSet<string> _installedAspNetRuntimes = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly HashSet<string> _installedDotnetRuntimes = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly HashSet<string> _installedDesktopRuntimes = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly HashSet<string> _ignoredDesktopRuntimes = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly HashSet<string> _installedSdks = new(StringComparer.OrdinalIgnoreCase);
 
         private const string _defaultUrl = "http://*:5010";
         private static readonly string _defaultHostname = Dns.GetHostName();
@@ -116,7 +115,8 @@ namespace Microsoft.Crank.Agent
         private static string _dotnethome;
         private static bool _cleanup = true;
         private static Process perfCollectProcess;
-        private static object _synLock = new object();
+        private static readonly object v = new();
+        private static readonly object _synLock = v;
 
         private static Task dotnetTraceTask;
         private static ManualResetEvent dotnetTraceManualReset;
@@ -124,6 +124,7 @@ namespace Microsoft.Crank.Agent
         public static OperatingSystem OperatingSystem { get; }
         public static Hardware Hardware { get; private set; }
         public static string HardwareVersion { get; private set; }
+
         public static TimeSpan DriverTimeout = TimeSpan.FromSeconds(10);
         public static TimeSpan StartTimeout = TimeSpan.FromMinutes(3);
         public static TimeSpan DefaultBuildTimeout = TimeSpan.FromMinutes(10);
@@ -137,7 +138,8 @@ namespace Microsoft.Crank.Agent
         private static CommandOption
             _relayConnectionStringOption,
             _relayPathOption,
-            _relayEnableHttpOption
+            _relayEnableHttpOption,
+            _runAsService
             ;
 
         static Startup()
@@ -200,9 +202,9 @@ namespace Microsoft.Crank.Agent
 
             var app = new CommandLineApplication()
             {
-                Name = "BenchmarksServer",
-                FullName = "ASP.NET Benchmark Server",
-                Description = "REST APIs to run ASP.NET benchmark server",
+                Name = "crank-agent",
+                FullName = "Crank Benchmarks Agent",
+                Description = "The Crank agent runs jobs sent from Crank controllers.",
                 OptionsComparison = StringComparison.OrdinalIgnoreCase
             };
 
@@ -214,20 +216,25 @@ namespace Microsoft.Crank.Agent
                 CommandOptionType.SingleValue);
             var dockerHostnameOption = app.Option("-nd|--docker-hostname", $"Hostname for benchmark server when running Docker on a different hostname.",
                 CommandOptionType.SingleValue);
-            var hardwareOption = app.Option("--hardware", "Hardware (Cloud or Physical).  Required.",
+            var hardwareOption = app.Option("--hardware", "Hardware (Cloud or Physical).",
                 CommandOptionType.SingleValue);
             var dotnethomeOption = app.Option("--dotnethome", "Folder to reuse for sdk and runtime installs.",
                 CommandOptionType.SingleValue);
             _relayConnectionStringOption = app.Option("--relay", "Connection string or environment variable name of the Azure Relay Hybrid Connection to listen to. e.g., Endpoint=sb://mynamespace.servicebus.windows.net;...", CommandOptionType.SingleValue);
             _relayPathOption = app.Option("--relay-path", "The hybrid connection name used to bind this agent. If not set the --relay argument must contain 'EntityPath={name}'", CommandOptionType.SingleValue);
             _relayEnableHttpOption = app.Option("--relay-enable-http", "Activates the HTTP port even if Azure Relay is used.", CommandOptionType.NoValue);
-            var hardwareVersionOption = app.Option("--hardware-version", "Hardware version (e.g, D3V2, Z420, ...).  Required.",
+            var hardwareVersionOption = app.Option("--hardware-version", "Hardware version (e.g, D3V2, Z420, ...).",
                 CommandOptionType.SingleValue);
             var noCleanupOption = app.Option("--no-cleanup",
                 "Don't kill processes or delete temp directories.", CommandOptionType.NoValue);
             var buildPathOption = app.Option("--build-path", "The path where applications are built.", CommandOptionType.SingleValue);
             var buildTimeoutOption = app.Option("--build-timeout", "Maximum duration of build task in minutes. Default 10 minutes.",
                 CommandOptionType.SingleValue);
+            _runAsService = app.Option("--service", "If specified, runs crank-agent as a service", CommandOptionType.NoValue);
+            if (_runAsService.HasValue() && OperatingSystem != OperatingSystem.Windows)
+            {
+                throw new PlatformNotSupportedException($"--service is only available on Windows");
+            }
 
             app.OnExecute(() =>
             {
@@ -351,7 +358,15 @@ namespace Microsoft.Crank.Agent
 
             var host = builder.Build();
 
-            var hostTask = host.RunAsync();
+            var hostTask = _runAsService.HasValue()
+                ? Task.Run(() =>
+                {
+                    if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                    {
+                        host.RunAsService();
+                    }
+                })
+                : host.RunAsync();
 
             _processJobsCts = new CancellationTokenSource();
             _processJobsTask = ProcessJobs(hostname, dockerHostname, _processJobsCts.Token);
@@ -518,6 +533,11 @@ namespace Microsoft.Crank.Agent
 
                         foreach (var job in group.Keys)
                         {
+                            if (job.State == JobState.Deleted)
+                            {
+                                continue;
+                            }
+
                             var context = group[job];
 
                             Log.WriteLine($"Processing job '{job.Service}' ({job.Id}) in state {job.State}");
@@ -1071,7 +1091,7 @@ namespace Microsoft.Crank.Agent
                                                                 }
                                                             }
 
-                                                            if (takeMeasurement && trackProcess != null)
+                                                            if (takeMeasurement && trackProcess != null && !trackProcess.HasExited)
                                                             {
                                                                 var newCPUTime = OperatingSystem == OperatingSystem.OSX
                                                                     ? TimeSpan.Zero
@@ -1302,7 +1322,7 @@ namespace Microsoft.Crank.Agent
                                     {
                                         context.CountersCompletionSource.SetResult(true);
 
-                                        Task.WaitAny(new Task[] { context.CountersTask }, 5000);
+                                        Task.WaitAny(new Task[] { context.CountersTask }, 10000);
 
                                         if (!context.CountersTask.IsCompleted)
                                         {
@@ -1343,7 +1363,7 @@ namespace Microsoft.Crank.Agent
                                     job.DumpFile = Path.GetTempFileName();
 
                                     var dumper = new Dumper();
-                                    dumper.Collect(job.ProcessId, job.DumpFile, job.DumpType);
+                                    dumper.Collect(job.ChildProcessId > 0 ? job.ChildProcessId : job.ProcessId, job.DumpFile, job.DumpType);
                                 }
 
                                 Log.WriteLine($"Stopping heartbeat ({job.Service}:{job.Id})");
@@ -2552,6 +2572,7 @@ namespace Microsoft.Crank.Agent
                 ;
 
             var dotnetInstallStep = "";
+            string dotnetFeed = "";
 
             try
             {
@@ -2565,12 +2586,25 @@ namespace Microsoft.Crank.Agent
                         Log.WriteLine($"Installing {dotnetInstallStep} ...");
 
                         // Install latest SDK version (and associated runtime)
-                        await ProcessUtil.RetryOnExceptionAsync(3, () => ProcessUtil.RunAsync("powershell", $"-NoProfile -ExecutionPolicy unrestricted [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; .\\dotnet-install.ps1 -Version {sdkVersion} -NoPath -SkipNonVersionedFiles -InstallDir {dotnetHome}",
-                        log: false,
-                        workingDirectory: _dotnetInstallPath,
-                        environmentVariables: env,
-                                cancellationToken: cancellationToken),
-                            cancellationToken);
+
+                        dotnetFeed = GetAzureFeedForVersion(sdkVersion);
+
+                        if (!await CheckPackageExistsAsync(PackageTypes.Sdk, sdkVersion))
+                        {
+                            throw new InvalidOperationException();
+                        }
+
+                        ProcessResult result = await ProcessUtil.RunAsync("powershell", $"-NoProfile -ExecutionPolicy unrestricted [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; .\\dotnet-install.ps1 -Version {sdkVersion} -NoPath -SkipNonVersionedFiles -InstallDir {dotnetHome} -AzureFeed {dotnetFeed}",
+                            log: false,
+                            throwOnError: false, 
+                            workingDirectory: _dotnetInstallPath,
+                            environmentVariables: env,
+                            cancellationToken: cancellationToken);
+
+                        if (result.ExitCode != 0)
+                        {
+                            throw new InvalidOperationException(); 
+                        }
 
                         _installedSdks.Add(sdkVersion);
                     }
@@ -2581,12 +2615,25 @@ namespace Microsoft.Crank.Agent
                         Log.WriteLine($"Installing {dotnetInstallStep} ...");
 
                         // Install runtimes required for this scenario
-                        await ProcessUtil.RetryOnExceptionAsync(3, () => ProcessUtil.RunAsync("powershell", $"-NoProfile -ExecutionPolicy unrestricted [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; .\\dotnet-install.ps1 -Version {runtimeVersion} -Runtime dotnet -NoPath -SkipNonVersionedFiles -InstallDir {dotnetHome}",
-                        log: false,
-                        workingDirectory: _dotnetInstallPath,
-                        environmentVariables: env,
-                                cancellationToken: cancellationToken),
-                            cancellationToken);
+
+                        dotnetFeed = GetAzureFeedForVersion(runtimeVersion);
+
+                        if (!await CheckPackageExistsAsync(PackageTypes.NetCoreApp, runtimeVersion))
+                        {
+                            throw new InvalidOperationException();
+                        }
+
+                        ProcessResult result = await ProcessUtil.RunAsync("powershell", $"-NoProfile -ExecutionPolicy unrestricted [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; .\\dotnet-install.ps1 -Version {runtimeVersion} -Runtime dotnet -NoPath -SkipNonVersionedFiles -InstallDir {dotnetHome} -AzureFeed {dotnetFeed}",
+                                log: false,
+                                throwOnError: false, 
+                                workingDirectory: _dotnetInstallPath,
+                                environmentVariables: env,
+                                cancellationToken: cancellationToken);
+
+                        if (result.ExitCode != 0)
+                        {
+                            throw new InvalidOperationException();
+                        }
 
                         _installedDotnetRuntimes.Add(runtimeVersion);
                     }
@@ -2605,12 +2652,24 @@ namespace Microsoft.Crank.Agent
                                 dotnetInstallStep = $"Desktop runtime '{desktopVersion}'";
                                 Log.WriteLine($"Installing {dotnetInstallStep} ...");
 
-                                await ProcessUtil.RetryOnExceptionAsync(3, () => ProcessUtil.RunAsync("powershell", $"-NoProfile -ExecutionPolicy unrestricted [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; .\\dotnet-install.ps1 -Version {desktopVersion} -Runtime windowsdesktop -NoPath -SkipNonVersionedFiles -InstallDir {dotnetHome}",
-                                log: false,
-                                workingDirectory: _dotnetInstallPath,
-                                environmentVariables: env,
-                                    cancellationToken: cancellationToken),
-                                cancellationToken);
+                                dotnetFeed = GetAzureFeedForVersion(desktopVersion);
+
+                                if (!await CheckPackageExistsAsync(PackageTypes.WindowsDesktop, desktopVersion))
+                                {
+                                    throw new InvalidOperationException();
+                                }
+
+                                ProcessResult result = await ProcessUtil.RunAsync("powershell", $"-NoProfile -ExecutionPolicy unrestricted [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; .\\dotnet-install.ps1 -Version {desktopVersion} -Runtime windowsdesktop -NoPath -SkipNonVersionedFiles -InstallDir {dotnetHome} -AzureFeed {dotnetFeed}",
+                                        log: false,
+                                        throwOnError: false, 
+                                        workingDirectory: _dotnetInstallPath,
+                                        environmentVariables: env,
+                                        cancellationToken: cancellationToken);
+
+                                if (result.ExitCode != 0)
+                                {
+                                    throw new InvalidOperationException();
+                                }
 
                                 _installedDesktopRuntimes.Add(desktopVersion);
                             }
@@ -2640,12 +2699,25 @@ namespace Microsoft.Crank.Agent
                         Log.WriteLine($"Installing {dotnetInstallStep} ...");
 
                         // Install aspnet runtime required for this scenario
-                        await ProcessUtil.RetryOnExceptionAsync(3, () => ProcessUtil.RunAsync("powershell", $"-NoProfile -ExecutionPolicy unrestricted [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; .\\dotnet-install.ps1 -Version {aspNetCoreVersion} -Runtime aspnetcore -NoPath -SkipNonVersionedFiles -InstallDir {dotnetHome}",
-                        log: false,
-                        workingDirectory: _dotnetInstallPath,
-                        environmentVariables: env,
-                                cancellationToken: cancellationToken),
-                            cancellationToken);
+
+                        dotnetFeed = GetAzureFeedForVersion(aspNetCoreVersion);
+
+                        if (!await CheckPackageExistsAsync(PackageTypes.AspNetCore, aspNetCoreVersion))
+                        {
+                            throw new InvalidOperationException();
+                        }
+
+                        ProcessResult result = await ProcessUtil.RunAsync("powershell", $"-NoProfile -ExecutionPolicy unrestricted [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; .\\dotnet-install.ps1 -Version {aspNetCoreVersion} -Runtime aspnetcore -NoPath -SkipNonVersionedFiles -InstallDir {dotnetHome} -AzureFeed {dotnetFeed}",
+                                log: false,
+                                throwOnError: false, 
+                                workingDirectory: _dotnetInstallPath,
+                                environmentVariables: env,
+                                cancellationToken: cancellationToken);
+
+                        if (result.ExitCode != 0)
+                        {
+                            throw new InvalidOperationException();
+                        }
 
                         _installedAspNetRuntimes.Add(aspNetCoreVersion);
                     }
@@ -2658,12 +2730,25 @@ namespace Microsoft.Crank.Agent
                         Log.WriteLine($"Installing {dotnetInstallStep} ...");
 
                         // Install latest SDK version (and associated runtime)
-                        await ProcessUtil.RetryOnExceptionAsync(3, () => ProcessUtil.RunAsync("/usr/bin/env", $"bash dotnet-install.sh --version {sdkVersion} --no-path --skip-non-versioned-files --install-dir {dotnetHome}",
-                        log: false,
-                        workingDirectory: _dotnetInstallPath,
-                        environmentVariables: env,
-                                cancellationToken: cancellationToken),
-                            cancellationToken);
+
+                        dotnetFeed = GetAzureFeedForVersion(sdkVersion);
+
+                        if (!await CheckPackageExistsAsync(PackageTypes.Sdk, sdkVersion))
+                        {
+                            throw new InvalidOperationException();
+                        }
+
+                        ProcessResult result = await ProcessUtil.RunAsync("/usr/bin/env", $"bash dotnet-install.sh --version {sdkVersion} --no-path --skip-non-versioned-files --install-dir {dotnetHome} -AzureFeed {dotnetFeed}",
+                                log: false,
+                                throwOnError: false, 
+                                workingDirectory: _dotnetInstallPath,
+                                environmentVariables: env,
+                                cancellationToken: cancellationToken);
+
+                        if (result.ExitCode != 0)
+                        {
+                            throw new InvalidOperationException();
+                        }
 
                         _installedSdks.Add(sdkVersion);
                     }
@@ -2674,12 +2759,25 @@ namespace Microsoft.Crank.Agent
                         Log.WriteLine($"Installing {dotnetInstallStep} ...");
 
                         // Install required runtime
-                        await ProcessUtil.RetryOnExceptionAsync(3, () => ProcessUtil.RunAsync("/usr/bin/env", $"bash dotnet-install.sh --version {runtimeVersion} --runtime dotnet --no-path --skip-non-versioned-files --install-dir {dotnetHome}",
-                        log: false,
-                        workingDirectory: _dotnetInstallPath,
-                        environmentVariables: env,
-                                cancellationToken: cancellationToken),
-                            cancellationToken);
+
+                        dotnetFeed = GetAzureFeedForVersion(runtimeVersion);
+
+                        if (!await CheckPackageExistsAsync(PackageTypes.NetCoreApp, runtimeVersion))
+                        {
+                            throw new InvalidOperationException();
+                        }
+
+                        ProcessResult result = await ProcessUtil.RunAsync("/usr/bin/env", $"bash dotnet-install.sh --version {runtimeVersion} --runtime dotnet --no-path --skip-non-versioned-files --install-dir {dotnetHome} -AzureFeed {dotnetFeed}",
+                                log: false,
+                                throwOnError: false,
+                                workingDirectory: _dotnetInstallPath,
+                                environmentVariables: env,
+                                cancellationToken: cancellationToken);
+
+                        if (result.ExitCode != 0)
+                        {
+                            throw new InvalidOperationException();
+                        }
 
                         _installedDotnetRuntimes.Add(runtimeVersion);
                     }
@@ -2691,12 +2789,25 @@ namespace Microsoft.Crank.Agent
                         Log.WriteLine($"Installing {dotnetInstallStep} ...");
 
                         // Install required runtime
-                        await ProcessUtil.RetryOnExceptionAsync(3, () => ProcessUtil.RunAsync("/usr/bin/env", $"bash dotnet-install.sh --version {aspNetCoreVersion} --runtime aspnetcore --no-path --skip-non-versioned-files --install-dir {dotnetHome}",
-                        log: false,
-                        workingDirectory: _dotnetInstallPath,
-                        environmentVariables: env,
-                                cancellationToken: cancellationToken),
-                            cancellationToken);
+
+                        dotnetFeed = GetAzureFeedForVersion(aspNetCoreVersion);
+
+                        if (!await CheckPackageExistsAsync(PackageTypes.AspNetCore, aspNetCoreVersion))
+                        {
+                            throw new InvalidOperationException();
+                        }
+
+                        ProcessResult result = await ProcessUtil.RunAsync("/usr/bin/env", $"bash dotnet-install.sh --version {aspNetCoreVersion} --runtime aspnetcore --no-path --skip-non-versioned-files --install-dir {dotnetHome} -AzureFeed {dotnetFeed}",
+                                log: false,
+                                throwOnError: false, 
+                                workingDirectory: _dotnetInstallPath,
+                                environmentVariables: env,
+                                cancellationToken: cancellationToken);
+
+                        if (result.ExitCode != 0)
+                        {
+                            throw new InvalidOperationException();
+                        }
 
                         _installedAspNetRuntimes.Add(aspNetCoreVersion);
                     }
@@ -4206,6 +4317,12 @@ namespace Microsoft.Crank.Agent
                 executable = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), @"System32\inetsrv\w3wp.exe");
             }
 
+            // If the platform is Linux, make sure we can run the executable 
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            {
+                await ProcessUtil.RunAsync("chmod", $"+x {executable}", log: true);
+            }
+
             // The cgroup limits are set on the root group as .NET is reading these only, and not the ones that it would run inside
 
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux) && (job.MemoryLimitInBytes > 0 || job.CpuLimitRatio > 0 || !String.IsNullOrEmpty(job.CpuSet)))
@@ -4383,24 +4500,60 @@ namespace Microsoft.Crank.Agent
                 RunAndTrace();
             }
 
-            // Don't wait for the counters to be ready as it could get stuck and block the agent
-            var _ = StartCountersAsync(job, context);
-
-            if (job.MemoryLimitInBytes > 0)
+            if ((job.MemoryLimitInBytes > 0 || !String.IsNullOrWhiteSpace(job.CpuSet)) && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
-                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-                {
-                    Log.WriteLine($"Creating job object with memory limits: {job.MemoryLimitInBytes}");
+                var safeProcess = Kernel32.OpenProcess(ACCESS_MASK.MAXIMUM_ALLOWED, false, (uint)process.Id);
 
-                    var manager = new ChildProcessManager(job.MemoryLimitInBytes);
-                    manager.AddProcess(process);
+                if (job.MemoryLimitInBytes > 0)
+                {
+                    Log.WriteLine($"Creating Job Object with memory limits: {job.MemoryLimitInBytes / 1024 / 1024:n0} MB");
+
+                    var hJob = Kernel32.CreateJobObject(null, job.RunId);
+                    var bi = Kernel32.QueryInformationJobObject<Kernel32.JOBOBJECT_EXTENDED_LIMIT_INFORMATION>(hJob, Kernel32.JOBOBJECTINFOCLASS.JobObjectExtendedLimitInformation);
+                    bi.BasicLimitInformation.LimitFlags |= Kernel32.JOBOBJECT_LIMIT_FLAGS.JOB_OBJECT_LIMIT_JOB_MEMORY;
+                    bi.JobMemoryLimit = job.MemoryLimitInBytes;
+
+                    Kernel32.SetInformationJobObject(hJob, Kernel32.JOBOBJECTINFOCLASS.JobObjectExtendedLimitInformation, bi);
+                    Kernel32.AssignProcessToJobObject(hJob, safeProcess);
 
                     process.Exited += (sender, e) =>
                     {
                         Log.WriteLine("Releasing job object");
-                        manager.Dispose();
+                        Kernel32.TerminateJobObject(hJob, 0);
+                        safeProcess.Dispose();
                     };
                 }
+
+                if (!String.IsNullOrWhiteSpace(job.CpuSet))
+                {
+                    var cpuSet = new List<int>();
+
+                    var ranges = job.CpuSet.Split(',', StringSplitOptions.RemoveEmptyEntries);
+                    foreach (var r in ranges)
+                    {
+                        var bounds = r.Split('-', 2);
+
+                        if (r.Length == 1)
+                        {
+                            cpuSet.Add(int.Parse(bounds[0]));
+                        }
+                        else
+                        {
+                            for (var i = int.Parse(bounds[0]); i<= int.Parse(bounds[1]); i++)
+                            {
+                                cpuSet.Add(i);
+                            }                            
+                        }
+                    }
+
+                    var ssi = Kernel32.GetSystemCpuSetInformation(safeProcess).ToArray();
+                    var cpuSets = cpuSet.Select(i => ssi[i].CpuSet.Id).ToArray();
+
+                    Log.WriteLine($"Limiting CpuSet ids: {String.Join(',', cpuSets)}");
+
+                    var result = Kernel32.SetProcessDefaultCpuSets(safeProcess, cpuSets, (uint)cpuSets.Length);
+                }              
+                
             }
 
             // We try to detect an endpoint is ready if we are running in IIS (no console logs)
@@ -4418,6 +4571,9 @@ namespace Microsoft.Crank.Agent
             {
                 if (MarkAsRunning(hostname, job, stopwatch))
                 {
+                    // Don't wait for the counters to be ready as it could get stuck and block the agent
+                    var _ = StartCountersAsync(job, context);
+
                     if (!job.CollectStartup)
                     {
                         if (job.Collect)
@@ -4653,11 +4809,28 @@ namespace Microsoft.Crank.Agent
                 if (context.CountersCompletionSource.Task.IsCompleted)
                 {
                     Log.WriteLine($"Reason: counters are being stopped");
-                } 
+                }
 
-                // It also interrupts the source.Process() blocking operation
-                context.EventPipeSession.Stop();
-                Log.WriteLine($"Event pipe session stopped ({job.Service}:{job.Id})");
+                try
+                {
+                    // It also interrupts the source.Process() blocking operation
+                    await context.EventPipeSession.StopAsync(default);
+
+                    Log.WriteLine($"Event pipe session stopped ({job.Service}:{job.Id})");
+                }
+                catch (ServerNotAvailableException)
+                {
+                    Log.WriteLine($"Event pipe session interupted, application has already exited ({job.Service}:{job.Id})");
+                }
+                catch (Exception e)
+                {
+                    Log.WriteLine($"Event pipe session failed stopping ({job.Service}:{job.Id}): {e}");
+                }
+                finally
+                {
+                    context.EventPipeSession.Dispose();
+                    context.EventPipeSession = null;
+                }
             });
 
             context.CountersTask = Task.WhenAll(streamTask, stopTask);
@@ -5137,6 +5310,54 @@ namespace Microsoft.Crank.Agent
             return null;
         }
 
+        public static string GetAzureFeedForVersion(string version)
+        {
+            return version.StartsWith("7.0")
+                ? "https://dotnetbuilds.azureedge.net/public" // since 7.0, nightly builds are on this feed
+                : "https://dotnetcli.azureedge.net/dotnet" // this is the default dotnet-install feed
+                ;
+        }
+
+        private static async Task<bool> CheckPackageExistsAsync(PackageTypes runtime, string version)
+        {
+            // packageIndexUrl -> https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet6/nuget/v3/flat2/[packageName]/index.json
+            // e.g., https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet6/nuget/v3/flat2/Microsoft.AspNetCore.App.Runtime.linux-x64/index.json
+            // actual package url -> https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet6/nuget/v3/flat2/[packageName]/[version]/[packageName].[version].nupkg
+
+            // https://dotnetcli.blob.core.windows.net/dotnet
+            // https://dotnetcli.blob.core.windows.net/dotnet/Runtime/main/latest.version
+            // aspnetcore: https://dotnetcli.azureedge.net/dotnet/aspnetcore/Runtime/6.0.0-preview.5.21220.5/aspnetcore-runtime-6.0.0-preview.5.21220.5-win-x64.zip
+            // dotnet: https://dotnetcli.azureedge.net/dotnet/Runtime/6.0.0-preview.5.21220.8/dotnet-runtime-6.0.0-preview.5.21220.8-win-x64.zip
+
+            var urlPattern = runtime switch
+            {
+                PackageTypes.Sdk => "{3}/Sdk/{0}/dotnet-sdk-{0}-{1}.{2}",
+                PackageTypes.AspNetCore => "{3}/aspnetcore/Runtime/{0}/aspnetcore-runtime-{0}-{1}.{2}",
+                PackageTypes.NetCoreApp => "{3}/Runtime/{0}/dotnet-runtime-{0}-{1}.{2}",
+                PackageTypes.WindowsDesktop => "{3}/Runtime/{0}/windowsdesktop-runtime-{0}-{1}.{2}",
+                _ => throw new InvalidOperationException()
+            };
+                
+            var extension = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+                ? "zip"
+                : "tar.gz"
+                ;
+
+            var dotnetFeed = GetAzureFeedForVersion(version);
+
+            var download_link = String.Format(urlPattern, version, GetPlatformMoniker(), extension, dotnetFeed);
+
+            Log.WriteLine($"Checking package: {download_link}");
+
+            var httpMessage = new HttpRequestMessage(HttpMethod.Head, download_link);
+            httpMessage.Headers.IfModifiedSince = DateTime.Now;
+
+            using var response = await _httpClient.SendAsync(httpMessage);
+
+            // If the file exists, it will return a 304, otherwise a 404
+            return response.StatusCode == HttpStatusCode.NotModified;
+        }
+
         private static async Task<string> GetFlatContainerVersion(string packageIndexUrl, string versionPrefix, bool checkDotnetInstallUrl = false)
         {
             var root = JObject.Parse(await DownloadContentAsync(packageIndexUrl));
@@ -5158,47 +5379,22 @@ namespace Microsoft.Crank.Agent
                 return latest.FirstOrDefault()?.OriginalVersion;
             }
 
+            var runtimeType = packageIndexUrl.Contains("Microsoft.AspNetCore.App.Runtime", StringComparison.OrdinalIgnoreCase)
+                ? PackageTypes.AspNetCore
+                : PackageTypes.NetCoreApp
+                ;
+
             foreach (var nugetVersion in latest.Take(3))
             {
                 var version = nugetVersion.OriginalVersion;
 
-                // packageIndexUrl -> https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet6/nuget/v3/flat2/[packageName]/index.json
-                // e.g., https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet6/nuget/v3/flat2/Microsoft.AspNetCore.App.Runtime.linux-x64/index.json
-                // actual package url -> https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet6/nuget/v3/flat2/[packageName]/[version]/[packageName].[version].nupkg
-
-                // https://dotnetcli.blob.core.windows.net/dotnet
-                // https://dotnetcli.blob.core.windows.net/dotnet/Runtime/main/latest.version
-                // aspnetcore: https://dotnetcli.azureedge.net/dotnet/aspnetcore/Runtime/6.0.0-preview.5.21220.5/aspnetcore-runtime-6.0.0-preview.5.21220.5-win-x64.zip
-                // dotnet: https://dotnetcli.azureedge.net/dotnet/Runtime/6.0.0-preview.5.21220.8/dotnet-runtime-6.0.0-preview.5.21220.8-win-x64.zip
-
-
-                var urlPattern = packageIndexUrl.Contains("Microsoft.AspNetCore.App.Runtime", StringComparison.OrdinalIgnoreCase) 
-                    ? "https://dotnetcli.azureedge.net/dotnet/aspnetcore/Runtime/{0}/aspnetcore-runtime-{0}-{1}.{2}"
-                    : "https://dotnetcli.azureedge.net/dotnet/Runtime/{0}/dotnet-runtime-{0}-{1}.{2}"
-                    ;
-
-                var extension = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
-                    ? "zip"
-                    : "tar.gz"
-                    ;
-
-                var download_link = String.Format(urlPattern, version, GetPlatformMoniker(), extension);
-
-                Log.WriteLine($"Checking package: {download_link}");
-
-                var httpMessage = new HttpRequestMessage(HttpMethod.Get, download_link);
-                httpMessage.Headers.IfModifiedSince = DateTime.Now;
-
-                var response = await _httpClient.SendAsync(httpMessage);
-
-                // If the file exists, it will return a 304, otherwise a 404
-                if (response.StatusCode == HttpStatusCode.NotModified)
-                {
+                if (await CheckPackageExistsAsync(runtimeType, version))
+                { 
                     return version;
                 }
                 else
                 {
-                    Log.WriteLine($"Package not available: {download_link}, status code: {response.StatusCode}");
+                    Log.WriteLine($"Package not available: {runtimeType} version {version}");
                 }
             }
 

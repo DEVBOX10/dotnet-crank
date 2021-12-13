@@ -51,6 +51,7 @@ namespace Microsoft.Crank.Controller
             _jobOption,
             _profileOption,
             _jsonOption,
+            _csvOption,
             _compareOption,
             _variableOption,
             _sqlConnectionStringOption,
@@ -127,7 +128,7 @@ namespace Microsoft.Crank.Controller
 
             var app = new CommandLineApplication()
             {
-                Name = "Crank",
+                Name = "crank",
                 FullName = "Crank Benchmarks Controller",
                 ExtendedHelpText = Documentation.Content,
                 Description = "The Crank controller orchestrates benchmark jobs on Crank agents.",
@@ -143,6 +144,7 @@ namespace Microsoft.Crank.Controller
             _profileOption = app.Option("--profile", "Profile name", CommandOptionType.MultipleValue);
             _scriptOption = app.Option("--script", "Execute a named script available in the configuration files. Can be used multiple times.", CommandOptionType.MultipleValue);
             _jsonOption = app.Option("-j|--json", "Saves the results as json in the specified file.", CommandOptionType.SingleValue);
+            _csvOption = app.Option("--csv", "Saves the results as csv in the specified file.", CommandOptionType.SingleValue);
             _compareOption = app.Option("--compare", "An optional filename to compare the results to. Can be used multiple times.", CommandOptionType.MultipleValue);
             _variableOption = app.Option("--variable", "Variable", CommandOptionType.MultipleValue);
             _sqlConnectionStringOption = app.Option("--sql",
@@ -552,6 +554,10 @@ namespace Microsoft.Crank.Controller
                         {
                             jobName = Path.GetFileNameWithoutExtension(_jsonOption.Value());
                         }
+                        else if (_csvOption.HasValue())
+                        {
+                            jobName = Path.GetFileNameWithoutExtension(_csvOption.Value());
+                        }
                     }
 
                     ResultComparer.Compare(_compareOption.Values, results.JobResults, jobName);
@@ -823,12 +829,13 @@ namespace Microsoft.Crank.Controller
                         continue;
                     }
 
+
                     var jobs = jobsByDependency[jobName];
 
                     if (!service.WaitForExit)
                     {
                         // Unless the jobs can't be stopped
-                        if (!SpanShouldKeepJobRunning(jobName))
+                        if (!SpanShouldKeepJobRunning(jobName) || IsLastIteration())
                         {
                             await Task.WhenAll(jobs.Select(job => job.StopAsync()));
                         }
@@ -836,7 +843,7 @@ namespace Microsoft.Crank.Controller
                         await Task.WhenAll(jobs.Select(job => job.TryUpdateJobAsync()));
 
                         // Unless the jobs can't be stopped
-                        if (!SpanShouldKeepJobRunning(jobName))
+                        if (!SpanShouldKeepJobRunning(jobName) || IsLastIteration())
                         {
                             await Task.WhenAll(jobs.Select(job => job.DownloadDumpAsync()));
 
@@ -890,9 +897,6 @@ namespace Microsoft.Crank.Controller
 
                     jobResults.Properties[segments[0]] = segments[1];
                 }
-
-                // Duplicate measurements with multiple keys
-                DuplicateMeasurementKeys(jobResults);
 
                 executionResult.JobResults = jobResults;
                 executionResults.Add(executionResult);
@@ -971,21 +975,119 @@ namespace Microsoft.Crank.Controller
 
                 if (_jsonOption.HasValue())
                 {
-                    var filename = _jsonOption.Value();
-                    
-                    var directory = Path.GetDirectoryName(filename);
-                    if (!String.IsNullOrEmpty(directory) && !Directory.Exists(directory))
-                    {
-                        Directory.CreateDirectory(directory);
-                    }
-
                     // Skip saving the file if running with iterations and not the last run
                     if (i == iterations)
                     {
+                        var filename = _jsonOption.Value();
+                    
+                        var directory = Path.GetDirectoryName(filename);
+                        if (!String.IsNullOrEmpty(directory) && !Directory.Exists(directory))
+                        {
+                            Directory.CreateDirectory(directory);
+                        }
+
                         await File.WriteAllTextAsync(filename, JsonConvert.SerializeObject(executionResults.First(), Formatting.Indented, new JsonSerializerSettings { ContractResolver = new CamelCasePropertyNamesContractResolver() }));
 
                         Log.Write("", notime: true);
                         Log.Write($"Results saved in '{new FileInfo(filename).FullName}'", notime: true);
+                    }
+                } 
+                
+                if (_csvOption.HasValue())
+                {
+                    // Skip saving the file if running with iterations and not the last run
+                    if (i == iterations)
+                    {
+                        var filename = _csvOption.Value();
+
+                        var directory = Path.GetDirectoryName(filename);
+                        if (!String.IsNullOrEmpty(directory) && !Directory.Exists(directory))
+                        {
+                            Directory.CreateDirectory(directory);
+                        }
+
+                        var result = executionResults.First();
+
+                        // Create the headers
+                        if (!File.Exists(filename))
+                        {
+                            using (var w = File.CreateText(filename))
+                            {
+                                await w.WriteLineAsync(String.Join(",", GetHeaders().Select(EscapeCsvValue)));
+                            }
+                        }
+
+                        await File.AppendAllTextAsync(filename, String.Join(",", GetValues().Select(EscapeCsvValue)) + Environment.NewLine);
+
+                        Log.Write("", notime: true);
+                        Log.Write($"Results saved in '{new FileInfo(filename).FullName}'", notime: true);
+
+
+                        IEnumerable<string> GetHeaders()
+                        {
+                            yield return "Session";
+                            yield return "DateTimeUtc";
+                            yield return "Description";
+
+                            foreach (var job in result.JobResults.Jobs)
+                            {
+                                foreach (var m in job.Value.Metadata)
+                                {
+                                    // application.aspnetCoreVersion
+                                    yield return job.Key + "." + m.Name;
+                                }
+
+                                foreach (var e in job.Value.Environment)
+                                {
+                                    yield return job.Key + "." + e.Key;
+                                }
+                            }
+
+                            foreach (var p in result.JobResults.Properties)
+                            {
+                                yield return p.Key;
+                            }
+                        }
+
+                        IEnumerable<string> GetValues()
+                        {
+                            yield return session;
+                            yield return DateTime.UtcNow.ToString("s");
+                            yield return _descriptionOption.Value();
+
+                            foreach (var job in result.JobResults.Jobs)
+                            {
+                                foreach (var m in job.Value.Metadata)
+                                {
+                                    yield return job.Value.Results.ContainsKey(m.Name)
+                                        ? Convert.ToString(job.Value.Results[m.Name], System.Globalization.CultureInfo.InvariantCulture)
+                                        : ""
+                                        ;
+                                }
+
+                                foreach (var e in job.Value.Environment)
+                                {
+                                    yield return Convert.ToString(e.Value, System.Globalization.CultureInfo.InvariantCulture);
+                                }
+                            }
+
+                            foreach (var p in result.JobResults.Properties)
+                            {
+                                yield return Convert.ToString(p.Value, System.Globalization.CultureInfo.InvariantCulture);
+                            }
+                        }
+
+                        string EscapeCsvValue(string value)
+                        {
+                            if (value.Contains("\""))
+                            {
+                                return "\"" + value.Replace("\"", "\"\"") + "\"";
+                            }
+                            else
+                            {
+                                return "\"" + value + "\"";
+                            }
+                        }
                     }
                 }
 
@@ -1016,9 +1118,14 @@ namespace Microsoft.Crank.Controller
                 return true;
             }
 
+            bool IsLastIteration()
+            {
+                return i >= iterations;
+            }
+
             bool SpanShouldKeepJobRunning(string jobName)
             {
-                if (IsRepeatOver())
+                if (IsRepeatOver() || IsRepeatOver())
                 {
                     return false;
                 }
@@ -1432,10 +1539,10 @@ namespace Microsoft.Crank.Controller
                 configurationInstance.Jobs[jobName] = new Job();
             }
 
-            // Pee-configuration
+            // Pre-configuration
             foreach (var job in configurationInstance.Jobs)
             {
-                // Force all jobs as self-contained by default. This can be overrided by command line config.
+                // Force all jobs as self-contained by default. This can be overriden by command line config.
                 // This can't be done in ServerJob for backward compatibility
                 job.Value.SelfContained = true;
 
@@ -1461,12 +1568,14 @@ namespace Microsoft.Crank.Controller
                     throw new ControllerException($"Could not find a profile named '{profileName}'. Possible values: '{availableProfiles}'");
                 }
 
-                var profile = (JObject)configuration["Profiles"][profileName];
+                var profile = (JObject) configuration["Profiles"][profileName];
 
                 // Patch all jobs with the profile's default values (Step 1)
                 var profileWithoutJob = (JObject) profile.DeepClone();
-                profileWithoutJob.Remove("jobs");
+                profileWithoutJob.Remove("jobs"); // remove both pascal and camel case properties
                 profileWithoutJob.Remove("Jobs");
+                profileWithoutJob.Remove("agents"); // 'jobs' was renamed 'agents' when name mapping was introduced
+                profileWithoutJob.Remove("Agents");
 
                 foreach (JProperty jobProperty in configuration["Jobs"] ?? new JObject())
                 {
@@ -1475,11 +1584,63 @@ namespace Microsoft.Crank.Controller
 
                 // Patch each specific job (Step 2)
 
-                var profileWithoutVariables = (JObject)profile.DeepClone();
-                profileWithoutVariables.Remove("variables");
-                profileWithoutVariables.Remove("Variables");
+                ;
 
-                PatchObject(configuration, profileWithoutVariables);
+                foreach (var serviceEntry in configurationInstance.Scenarios[scenarioName])
+                {
+                    var serviceName = serviceEntry.Key;
+
+                    var service = configuration["Jobs"][serviceName] as JObject;
+
+                    if (service == null)
+                    {
+                        throw new ControllerException($"Could not find a service named '{serviceName}' while applying profiles");
+                    }
+
+                    // Apply profile on each service:
+                    // 1- if a service has an agent property use it to match an agent name or its aliases
+                    // 2- otherwise use the service name to match an agent name or its aliases
+
+                    string agentName = null;
+
+                    if (!String.IsNullOrEmpty(serviceEntry.Value.Agent))
+                    {
+                        agentName = serviceEntry.Value.Agent;
+                    }
+                    else
+                    {
+                        agentName = serviceName;
+                    }
+
+                    var agents = (profile["agents"] ?? profile["jobs"]) as JObject;
+
+
+                    // Seek the definition for this profile and agent
+                    var profileAgent = agents.Properties().FirstOrDefault(x =>
+                    {
+                        if (x.Name == agentName)
+                        {
+                            return true;
+                        }
+
+                        if (x.Value is JObject v
+                            && v.TryGetValue("aliases", out var aliases)
+                            && aliases is JArray aliasesArray
+                            && aliasesArray.Values().Select(a => a.Value<string>()).Contains(agentName))
+                        {
+                            return true;
+                        }
+
+                        return false;
+                    })?.Value as JObject;
+
+                    if (profileAgent == null)
+                    {
+                        throw new ControllerException($"Could not find an agent named '{agentName}'.");
+                    }
+
+                    PatchObject(service, profileAgent);
+                }
             }
 
             // Apply custom arguments
@@ -1535,9 +1696,9 @@ namespace Microsoft.Crank.Controller
                 var variables = MergeVariables(rootVariables, jobVariables, commandLineVariables);
 
                 // Apply templates on variables first
-                ApplyTemplates(variables, new TemplateContext { Model = variables.DeepClone() });
+                ApplyTemplates(variables, new TemplateContext(variables.DeepClone()));
 
-                ApplyTemplates(job, new TemplateContext { Model = variables }.SetValue("job", job));
+                ApplyTemplates(job, new TemplateContext(variables).SetValue("job", job));
 
                 // Variable are merged again in the job such that all variables (root, job, command line) be
                 // available in scripts
@@ -2008,13 +2169,28 @@ namespace Microsoft.Crank.Controller
             }                
 
             // Import default scripts sections
-            foreach (var script in configuration.DefaultScripts)
+            foreach (var script in configuration.OnResultsCreating)
             {
                 if (!String.IsNullOrWhiteSpace(script))
                 {
                     engine.Execute(script);
                 }
             }
+
+#pragma warning disable CS0618 // Type or member is obsolete
+            if (configuration.DefaultScripts != null && configuration.DefaultScripts.Any())
+            {
+                Log.WriteWarning($"WARNING: 'defaultScripts' has been deprecated, in the future please use 'onResultsCreating'.");
+
+                foreach (var script in configuration.OnResultsCreating)
+                {
+                    if (!String.IsNullOrWhiteSpace(script))
+                    {
+                        engine.Execute(script);
+                    }
+                }
+            }
+#pragma warning restore CS0618 // Type or member is obsolete
 
             foreach (var jobName in dependencies)
             {
@@ -2112,6 +2288,10 @@ namespace Microsoft.Crank.Controller
                 jobResult.Environment = await jobConnections.First().GetInfoAsync();
             }
 
+            // Duplicate measurements with multiple keys
+            DuplicateMeasurementKeys(jobResults);
+
+
             // Apply scripts
 
             // When scripts are executed, the metadata and measurements are still available.
@@ -2119,8 +2299,17 @@ namespace Microsoft.Crank.Controller
             // of any job connection (multi endpoint job) are taken.
             // The "measurements" property is an array of arrays of measurements.
             // The "results" property contains all measures that are already aggregated and reduced.
-             
-            
+            // The "benchmarks" property contains all jobs by name
+
+            // Run scripts for OnResultsCreated
+            foreach (var script in configuration.OnResultsCreated)
+            {
+                if (!String.IsNullOrWhiteSpace(script))
+                {
+                    engine.Execute(script);
+                }
+            }
+
             // Run custom scripts after the results are computed
             foreach (var scriptName in _scriptOption.Values)
             {
