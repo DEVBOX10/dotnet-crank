@@ -46,11 +46,22 @@ namespace Microsoft.Crank.Jobs.Bombardier
             TryGetArgumentValue("-w", argsList, out int warmup);
             TryGetArgumentValue("-d", argsList, out int duration);
             TryGetArgumentValue("-n", argsList, out int requests);
+            TryGetArgumentValue("-o", argsList, out string outputFormat);
             TryGetArgumentValue("-f", argsList, out string bodyFile);
 
             if (duration == 0 && requests == 0)
             {
                 Console.WriteLine("Couldn't find valid -d and -n arguments (integers)");
+                return -1;
+            }
+
+            if (string.IsNullOrEmpty(outputFormat))
+            {
+                outputFormat = "json";
+            }
+            else if ((outputFormat != "json") && (outputFormat != "plain-text"))
+            {
+                Console.WriteLine("Value value for -o is json or plain-text");
                 return -1;
             }
 
@@ -134,7 +145,7 @@ namespace Microsoft.Crank.Jobs.Bombardier
 
             args = argsList.Select(Quote).ToArray();
 
-            var baseArguments = String.Join(' ', args) + " --print r --format json";
+            var baseArguments = String.Join(' ', args) + $" --print r --format {outputFormat}";
 
             var process = new Process()
             {
@@ -175,6 +186,7 @@ namespace Microsoft.Crank.Jobs.Bombardier
 
                 if (process.ExitCode != 0)
                 {
+                    Console.WriteLine("Failed to run bombardier.");
                     return process.ExitCode;
                 }
             }
@@ -216,10 +228,21 @@ namespace Microsoft.Crank.Jobs.Bombardier
                     output = stringBuilder.ToString();
                 }
 
+                if (outputFormat != "json")
+                {
+                    return 0;
+                }
+
                 var document = JObject.Parse(output);
 
                 BenchmarksEventSource.Register("bombardier/requests;http/requests", Operations.Max, Operations.Sum, "Requests", "Total number of requests", "n0");
                 BenchmarksEventSource.Register("bombardier/badresponses;http/requests/badresponses", Operations.Max, Operations.Sum, "Bad responses", "Non-2xx or 3xx responses", "n0");
+
+                BenchmarksEventSource.Register("bombardier/latency/50;http/latency/50", Operations.Max, Operations.Max, "Latency 50th (us)", "Latency 50th (us)", "n0");
+                BenchmarksEventSource.Register("bombardier/latency/75;http/latency/75", Operations.Max, Operations.Max, "Latency 75th (us)", "Latency 75th (us)", "n0");
+                BenchmarksEventSource.Register("bombardier/latency/90;http/latency/90", Operations.Max, Operations.Max, "Latency 90th (us)", "Latency 90th (us)", "n0");
+                BenchmarksEventSource.Register("bombardier/latency/95;http/latency/95", Operations.Max, Operations.Max, "Latency 95th (us)", "Latency 95th (us)", "n0");
+                BenchmarksEventSource.Register("bombardier/latency/99;http/latency/99", Operations.Max, Operations.Max, "Latency 99th (us)", "Latency 99th (us)", "n0");
 
                 BenchmarksEventSource.Register("bombardier/latency/mean;http/latency/mean", Operations.Max, Operations.Avg, "Mean latency (us)", "Mean latency (us)", "n0");
                 BenchmarksEventSource.Register("bombardier/latency/max;http/latency/max", Operations.Max, Operations.Max, "Max latency (us)", "Max latency (us)", "n0");
@@ -243,6 +266,12 @@ namespace Microsoft.Crank.Jobs.Bombardier
                 BenchmarksEventSource.Measure("bombardier/requests;http/requests", total);
                 BenchmarksEventSource.Measure("bombardier/badresponses;http/requests/badresponses", total - success);
 
+                BenchmarksEventSource.Measure("bombardier/latency/50;http/latency/50", document["result"]["latency"]["percentiles"]["50"].Value<double>());
+                BenchmarksEventSource.Measure("bombardier/latency/75;http/latency/75", document["result"]["latency"]["percentiles"]["75"].Value<double>());
+                BenchmarksEventSource.Measure("bombardier/latency/90;http/latency/90", document["result"]["latency"]["percentiles"]["90"].Value<double>());
+                BenchmarksEventSource.Measure("bombardier/latency/95;http/latency/95", document["result"]["latency"]["percentiles"]["95"].Value<double>());
+                BenchmarksEventSource.Measure("bombardier/latency/99;http/latency/99", document["result"]["latency"]["percentiles"]["99"].Value<double>());
+
                 BenchmarksEventSource.Measure("bombardier/latency/mean;http/latency/mean", document["result"]["latency"]["mean"].Value<double>());
                 BenchmarksEventSource.Measure("bombardier/latency/max;http/latency/max", document["result"]["latency"]["max"].Value<double>());
 
@@ -254,7 +283,7 @@ namespace Microsoft.Crank.Jobs.Bombardier
                 var bytesPerSecond = document["result"]["bytesRead"].Value<long>() / document["result"]["timeTakenSeconds"].Value<double>();
 
                 // B/s to MB/s
-                BenchmarksEventSource.Measure("bombardier/throughput", bytesPerSecond / 1024 / 1024);
+                BenchmarksEventSource.Measure("bombardier/throughput;http/throughput", bytesPerSecond / 1024 / 1024);
             }
             else
             {

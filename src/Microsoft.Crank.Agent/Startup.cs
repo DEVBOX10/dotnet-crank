@@ -1,4 +1,4 @@
-// Licensed to the .NET Foundation under one or more agreements.
+﻿// Licensed to the .NET Foundation under one or more agreements.
 // The .NET Foundation licenses this file to you under the MIT license.
 // See the LICENSE file in the project root for more information.
 
@@ -374,15 +374,24 @@ namespace Microsoft.Crank.Agent
 
             var host = builder.Build();
 
-            var hostTask = _runAsService.HasValue()
-                ? Task.Run(() =>
+            Task hostTask;
+            if (_runAsService.HasValue())
+            {
+                hostTask = Task.Run(() =>
                 {
                     if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                     {
                         host.RunAsService();
                     }
-                })
-                : host.RunAsync();
+                });
+            }
+            else
+            {
+                // Make sure the server is started before accepting new jobs
+                await host.StartAsync();
+                hostTask = host.WaitForShutdownAsync();
+            }
+
 
             _processJobsCts = new CancellationTokenSource();
             _processJobsTask = ProcessJobs(hostname, dockerHostname, _processJobsCts.Token);
@@ -748,6 +757,48 @@ namespace Microsoft.Crank.Agent
                                         });
                                     }
 
+                                    if (!job.Metadata.Any(x => x.Name == "benchmarks/cpu/periods/total"))
+                                    {
+                                        job.Metadata.Enqueue(new MeasurementMetadata
+                                        {
+                                            Source = "Host Process",
+                                            Name = "benchmarks/cpu/periods/total",
+                                            Aggregate = Operation.Max,
+                                            Reduce = Operation.Sum,
+                                            Format = "n0",
+                                            LongDescription = "Number of periods that any thread in the cgroup was runnable",
+                                            ShortDescription = "Runnable Periods (#)"
+                                        });
+                                    }
+
+                                    if (!job.Metadata.Any(x => x.Name == "benchmarks/cpu/periods/throttled"))
+                                    {
+                                        job.Metadata.Enqueue(new MeasurementMetadata
+                                        {
+                                            Source = "Host Process",
+                                            Name = "benchmarks/cpu/periods/throttled",
+                                            Aggregate = Operation.Max,
+                                            Reduce = Operation.Sum,
+                                            Format = "n0",
+                                            LongDescription = "Number of runnable periods in which the application used its entire quota and was throttled",
+                                            ShortDescription = "Throttled Periods (#)"
+                                        });
+                                    }
+
+                                    if (!job.Metadata.Any(x => x.Name == "benchmarks/cpu/throttled"))
+                                    {
+                                        job.Metadata.Enqueue(new MeasurementMetadata
+                                        {
+                                            Source = "Host Process",
+                                            Name = "benchmarks/cpu/throttled",
+                                            Aggregate = Operation.Max,
+                                            Reduce = Operation.Sum,
+                                            Format = "n0",
+                                            LongDescription = "Total amount of time individual threads within the cgroup were throttled",
+                                            ShortDescription = "Throttled Time (ns)"
+                                        });
+                                    }
+
                                 }
 
                             }
@@ -931,7 +982,7 @@ namespace Microsoft.Crank.Agent
                                                         }
                                                     }
 
-                                                    if (!String.IsNullOrEmpty(dockerImage))
+                                                    if (job.Source.IsDocker())
                                                     {
                                                         // Check the container is still running
                                                         var inspectResult = ProcessUtil.RunAsync("docker", "inspect -f {{.State.Running}} " + dockerContainerId,
@@ -950,6 +1001,10 @@ namespace Microsoft.Crank.Agent
                                                             if (takeMeasurement)
                                                             {
                                                                 // Get docker stats
+                                                                // docker stats takes two seconds to return the results because it needs to collect data twice (rate is 1/s) to compute CPU usage
+                                                                // This makes the rate of measurements 1 every 3s and reduces the number of data points send to the controller
+                                                                // Hence dotnet process based jobs are sending 3 times more information
+
                                                                 var result = ProcessUtil.RunAsync("docker", "container stats --no-stream --format \"{{.CPUPerc}}-{{.MemUsage}}\" " + dockerContainerId,
                                                                         log: false, throwOnError: false, captureOutput: true, captureError: true).GetAwaiter().GetResult();
 
@@ -1408,6 +1463,23 @@ namespace Microsoft.Crank.Agent
                                 {
                                     var controller = GetCGroupController(job);
 
+                                    // Read cpu throttling stats
+
+                                    string cpuStats;
+
+                                    if (job.Source.IsDocker())
+                                    {
+                                        var result = await ProcessUtil.RunAsync("docker", $"exec {dockerContainerId} cat /sys/fs/cgroup/cpu/cpu.stat", throwOnError: false, captureOutput: true);
+                                        cpuStats = result.StandardOutput;
+                                    }
+                                    else
+                                    {
+                                        var result = await ProcessUtil.RunAsync("cat", $"/sys/fs/cgroup/cpu/{controller}/cpu.stat", throwOnError: false, captureOutput: true);
+                                        cpuStats = result.StandardOutput;
+                                    }
+
+                                    MeasureCpuStats(cpuStats, job);
+
                                     await ProcessUtil.RunAsync("cgdelete", $"cpu,memory,cpuset:{controller}", log: true, throwOnError: false);
                                 }
 
@@ -1569,7 +1641,7 @@ namespace Microsoft.Crank.Agent
 
                                     process = null;
                                 }
-                                else if (!String.IsNullOrEmpty(dockerImage))
+                                else if (job.Source.IsDocker())
                                 {
                                     await DockerCleanUpAsync(dockerContainerId, dockerImage, job);
                                 }
@@ -2013,8 +2085,6 @@ namespace Microsoft.Crank.Agent
                             });
                         }
                     }
-
-                  
                 }
                 else
                 {
@@ -2054,6 +2124,21 @@ namespace Microsoft.Crank.Agent
 
             // Delete container if the same name already exists
             // await ProcessUtil.RunAsync("docker", $"rm {imageName}", throwOnError: false);
+
+            if (!String.IsNullOrWhiteSpace(job.CpuSet))
+            {
+                environmentArguments += $"--cpuset-cpus=\"{job.CpuSet}\" ";
+            }
+
+            if (job.CpuLimitRatio > 0)
+            {
+                environmentArguments += $"--cpu-quota=\"{Math.Floor(job.CpuLimitRatio * _defaultDockerCfsPeriod)}\" ";
+            }
+
+            if (job.MemoryLimitInBytes > 0)
+            {
+                environmentArguments += $"--memory=\"{job.MemoryLimitInBytes}b\" ";
+            }
 
             var command = OperatingSystem == OperatingSystem.Linux
                 ? $"run -d {environmentArguments} {job.Arguments} --label benchmarks --name {containerName} --privileged --network host {imageName} {source.DockerCommand}"
@@ -3629,6 +3714,12 @@ namespace Microsoft.Crank.Agent
                     var globalObject = JObject.Parse(File.ReadAllText(globalJsonFilename));
                     sdkVersion = globalObject["sdk"]["version"].ToString();
 
+                    // Patch global.json such that the version for SDK is preserved even though a new one is locally available
+                    globalObject["sdk"]["allowPrerelease"] = true;
+                    globalObject["sdk"]["rollForward"] = "disable";
+
+                    File.WriteAllText(globalJsonFilename, globalObject.ToString());
+
                     Log.Info($"Detecting global.json SDK version: {sdkVersion}");
                 }
             }
@@ -3652,7 +3743,15 @@ namespace Microsoft.Crank.Agent
                     // Create the "sdk" property if it doesn't exist
                     globalObject.TryAdd("sdk", new JObject());
 
+                    // "sdk": {
+                    //    "version": "6.0.101",
+                    //    "allowPrerelease": true,
+                    //    "rollForward": "disable"
+                    // }
+
                     globalObject["sdk"]["version"] = new JValue(sdkVersion);
+                    globalObject["sdk"]["allowPrerelease"] = true;
+                    globalObject["sdk"]["rollForward"] = "disable";
 
                     File.WriteAllText(globalJsonFilename, globalObject.ToString());
                 }
@@ -3872,7 +3971,7 @@ namespace Microsoft.Crank.Agent
             }
             else if (String.Equals(sdkVersion, "Edge", StringComparison.OrdinalIgnoreCase))
             {
-                (sdkVersion, _) = await ParseLatestVersionFile(_latestSdkVersionUrl);
+                (sdkVersion, _) = await ParseVersionsFile(_latestSdkVersionUrl, "installer");
                 Log.Info($"SDK: {sdkVersion} (Edge)");
             }
             else
@@ -4115,6 +4214,36 @@ namespace Microsoft.Crank.Agent
 
                 return (version, hash);
             }
+        }
+
+        /// <summary>
+        /// Parses files that contains lines with [prefix]:[sha], [version]
+        /// </summary>
+        private static async Task<(string version, string hash)> ParseVersionsFile(string urlOrFilename, string prefix)
+        {
+            var content = urlOrFilename.StartsWith("http", StringComparison.OrdinalIgnoreCase)
+                ? await DownloadContentAsync(urlOrFilename)
+                : await File.ReadAllTextAsync(urlOrFilename)
+                ;
+
+            using (var sr = new StringReader(content))
+            {
+                string line = null;
+
+                while (null != (line = sr.ReadLine()))
+                {
+                    if (line.StartsWith(prefix))
+                    {
+                        var fragments = line.Split(',', 2);
+                        var hash = fragments[0].Split(':', 2)[1].Trim();
+                        var version = fragments[1].Trim();
+
+                        return (version, hash);
+                    }
+                }
+            }
+
+            return (null, null);
         }
 
         private static async Task<bool> DownloadFileAsync(string url, string outputPath, int maxRetries, int timeout = 5, bool throwOnError = true)
@@ -5010,100 +5139,115 @@ namespace Microsoft.Crank.Agent
                 : "x64"
                 ;
 
-            try
+            var fileName = "/bin/bash";
+
+            //Download dotnet sdk package
+            var dotnetMonoRootPath = Path.Combine(_rootTempDir, "dotnet-mono");
+            var dotnetMonoPath = Path.Combine(_rootTempDir, "dotnet-mono", $"dotnet-sdk-{dotnetSdkVersion}-linux-{pkgNameSuffix}.tar.gz");
+            var dotnetMonoExePath = Path.Combine(_rootTempDir, "dotnet-mono", "dotnet");
+            var packageName = $"Microsoft.NETCore.App.Runtime.Mono.LLVM.AOT.linux-{pkgNameSuffix}".ToLowerInvariant();
+            var runtimePath = Path.Combine(_rootTempDir, "RuntimePackages", $"{packageName}.{runtimeVersion}.nupkg");
+            var llvmExtractDir = Path.Combine(Path.GetDirectoryName(runtimePath), "mono-llvm");
+
+            // Get dotnet sdk
+            if (!File.Exists(dotnetMonoPath) || !File.Exists(dotnetMonoExePath))
             {
-                var fileName = "/bin/bash";
-
-                //Download dotnet sdk package
-                var dotnetMonoPath = Path.Combine(_rootTempDir, "dotnet-mono", $"dotnet-sdk-{dotnetSdkVersion}-linux-{pkgNameSuffix}.tar.gz");
-                var packageName = $"Microsoft.NETCore.App.Runtime.Mono.LLVM.AOT.linux-{pkgNameSuffix}".ToLowerInvariant();
-                var runtimePath = Path.Combine(_rootTempDir, "RuntimePackages", $"{packageName}.{runtimeVersion}.nupkg");
-                var llvmExtractDir = Path.Combine(Path.GetDirectoryName(runtimePath), "mono-llvm");
-		
-                if (!Directory.Exists(Path.GetDirectoryName(dotnetMonoPath)))
+                if (Directory.Exists(dotnetMonoRootPath))
                 {
-                    Directory.CreateDirectory(Path.GetDirectoryName(dotnetMonoPath));
+                    Log.Info("Deleting dotnet-mono folder...");
+                    Directory.Delete(dotnetMonoRootPath);
+                }
+                Log.Info("Creating dotnet-mono folder...");
+                Directory.CreateDirectory(dotnetMonoRootPath);
+                
+                Log.Info("Downloading dotnet skd package for mono AOT...");
 
-                    Log.Info($"Downloading dotnet skd package for mono AOT");
+                var found = false;
+                
+                var url = $"{GetAzureFeedForVersion(dotnetSdkVersion)}/Sdk/{dotnetSdkVersion}/dotnet-sdk-{dotnetSdkVersion}-linux-{pkgNameSuffix}.tar.gz";
 
-                    var found = false;
-                    var url = $"https://dotnetcli.azureedge.net/dotnet/Sdk/{dotnetSdkVersion}/dotnet-sdk-{dotnetSdkVersion}-linux-{pkgNameSuffix}.tar.gz";
+                if (await DownloadFileAsync(url, dotnetMonoPath, maxRetries: 3, timeout: 60, throwOnError: false))
+                {
+                    found = true;
+                }
 
-                    if (await DownloadFileAsync(url, dotnetMonoPath, maxRetries: 3, timeout: 60, throwOnError: false))
-                    {
-                        found = true;
-                    }
-
-                    if (!found)
-                    {
-                        throw new Exception("dotnet sdk package not found");
-                    }
-                    else
-                    {
-                        var strCmdTar = $"tar -xf dotnet-sdk-{dotnetSdkVersion}-linux-{pkgNameSuffix}.tar.gz";
-                        var resultTar = await ProcessUtil.RunAsync(fileName,
-                            ConvertCmd2Arg(strCmdTar),
-                            workingDirectory: Path.GetDirectoryName(dotnetMonoPath),
-                            log: true);
-                    }
-
-                    Log.Info($"Patching local dotnet with mono runtime and extracting llvm");
-
-                    if (Directory.Exists(llvmExtractDir))
-                    {
-                        Directory.Delete(llvmExtractDir);
-                    }
-
-                    Directory.CreateDirectory(llvmExtractDir);
-
-                    using (var archive = ZipFile.OpenRead(runtimePath))
-                    {
-                        var llcExe = archive.GetEntry($"runtimes/linux-{pkgNameSuffix}/native/llc");
-                        llcExe.ExtractToFile(Path.Combine(llvmExtractDir, "llc"), true);
-
-                        var optExe = archive.GetEntry($"runtimes/linux-{pkgNameSuffix}/native/opt");
-                        optExe.ExtractToFile(Path.Combine(llvmExtractDir, "opt"), true);
-                    }
-                    
-                    var strCmdChmod = "chmod +x opt llc";
-                    var resultChmod = await ProcessUtil.RunAsync(
-                        fileName, ConvertCmd2Arg(strCmdChmod),
-                        workingDirectory: llvmExtractDir,
-                        log: true);
+                if (!found)
+                {
+                    throw new Exception($"Failed to download dotnet sdk package from {url}");
                 }
                 else
                 {
-                    Log.Info($"Found local dotnet with mono runtime at '{Path.GetDirectoryName(dotnetMonoPath)}'");
+                    var strCmdTar = $"tar -xf dotnet-sdk-{dotnetSdkVersion}-linux-{pkgNameSuffix}.tar.gz";
+                    var resultTar = await ProcessUtil.RunAsync(fileName,
+                        ConvertCmd2Arg(strCmdTar),
+                        workingDirectory: dotnetMonoRootPath,
+                        log: true);
+                }
+            }
+            else
+            {
+                Log.Info($"Found local dotnet skd for mono.");
+            }
+
+            // Get LLVM executables
+            if (!File.Exists(Path.Combine(llvmExtractDir, "llc")) || !File.Exists(Path.Combine(llvmExtractDir, "opt")))
+            {
+                Log.Info($"Extracting llvm executables to local dotnet-mono location...");
+
+                if (Directory.Exists(llvmExtractDir))
+                {
+                    Directory.Delete(llvmExtractDir);
                 }
 
-                // Copy over mono runtime
-                var strCmdGetVer = "./dotnet --list-runtimes | grep -i \"Microsoft.NETCore.App\"";
-                var resultGetVer = await ProcessUtil.RunAsync(
-                    fileName, 
-                    ConvertCmd2Arg(strCmdGetVer),
-                    workingDirectory: Path.GetDirectoryName(dotnetMonoPath),
-                    log: true,
-                    captureOutput: true);
+                Directory.CreateDirectory(llvmExtractDir);
 
-                var MicrosoftNETCoreAppPackageVersion = resultGetVer.StandardOutput.Split(' ')[1];
-                File.Copy(Path.Combine(outputFolder, "System.Private.CoreLib.dll"), Path.Combine(Path.GetDirectoryName(dotnetMonoPath), "shared", "Microsoft.NETCore.App", MicrosoftNETCoreAppPackageVersion, "System.Private.CoreLib.dll"), true);
-                File.Copy(Path.Combine(outputFolder, "libcoreclr.so"), Path.Combine(Path.GetDirectoryName(dotnetMonoPath), "shared", "Microsoft.NETCore.App", MicrosoftNETCoreAppPackageVersion, "libcoreclr.so"), true);
+                using (var archive = ZipFile.OpenRead(runtimePath))
+                {
+                    var llcExe = archive.GetEntry($"runtimes/linux-{pkgNameSuffix}/native/llc");
+                    llcExe.ExtractToFile(Path.Combine(llvmExtractDir, "llc"), true);
 
-                Log.Info("Pre-compile assemblies inside publish folder");
-
-                var strCmdPreCompile = $@"for assembly in {outputFolder}/*.dll; do
-                                              PATH={llvmExtractDir}:${{PATH}} MONO_ENV_OPTIONS=--aot=llvm,mcpu=native ./dotnet $assembly;
-                                           done";
-                var resultPreCompile = await ProcessUtil.RunAsync(fileName, ConvertCmd2Arg(strCmdPreCompile),
-                                                   workingDirectory: Path.GetDirectoryName(dotnetMonoPath),
-                                                   log: true,
-                                                   captureOutput: true);
+                    var optExe = archive.GetEntry($"runtimes/linux-{pkgNameSuffix}/native/opt");
+                    optExe.ExtractToFile(Path.Combine(llvmExtractDir, "opt"), true);
+                }
+                
+                var strCmdChmod = "chmod +x opt llc";
+                var resultChmod = await ProcessUtil.RunAsync(
+                    fileName, ConvertCmd2Arg(strCmdChmod),
+                    workingDirectory: llvmExtractDir,
+                    log: true);
             }
-            catch (Exception e)
+            else
             {
-                Log.Error(e, "ERROR: Failed to AOT for mono.");
-                throw;
+                Log.Info($"Found LLVM executables.");
             }
+
+            Log.Info("Copy over mono runtime...");
+
+            var strCmdGetVer = "./dotnet --list-runtimes | grep -i \"Microsoft.NETCore.App\"";
+            var resultGetVer = await ProcessUtil.RunAsync(
+                fileName, 
+                ConvertCmd2Arg(strCmdGetVer),
+                workingDirectory: dotnetMonoRootPath,
+                log: true,
+                captureOutput: true);
+
+            var MicrosoftNETCoreAppPackageVersion = resultGetVer.StandardOutput.Split(' ')[1];
+            File.Copy(Path.Combine(outputFolder, "System.Private.CoreLib.dll"), Path.Combine(dotnetMonoRootPath, "shared", "Microsoft.NETCore.App", MicrosoftNETCoreAppPackageVersion, "System.Private.CoreLib.dll"), true);
+            File.Copy(Path.Combine(outputFolder, "libcoreclr.so"), Path.Combine(dotnetMonoRootPath, "shared", "Microsoft.NETCore.App", MicrosoftNETCoreAppPackageVersion, "libcoreclr.so"), true);
+
+            Log.Info("Pre-compile assemblies inside publish folder");
+            
+            var aotOption = RuntimeInformation.ProcessArchitecture == Architecture.Arm64
+            ? "mcpu=native,mattr=crypto,mattr=crc"
+            : "mcpu=native,mattr=sse4.2,mattr=popcnt,mattr=lzcnt,mattr=bmi,mattr=bmi2,mattr=pclmul,mattr=aes"
+            ;
+            var strCmdPreCompile = $@"for assembly in {outputFolder}/*.dll; do
+                                        MONO_ENV_OPTIONS=--aot=llvm,llvm-path={llvmExtractDir},{aotOption} ./dotnet $assembly;
+                                    done";
+            var resultPreCompile = await ProcessUtil.RunAsync(fileName, ConvertCmd2Arg(strCmdPreCompile),
+                                                workingDirectory: dotnetMonoRootPath,
+                                                log: true,
+                                                captureOutput: true);
         }
 
         private static string ConvertCmd2Arg(string cmd)
@@ -5195,6 +5339,65 @@ namespace Microsoft.Crank.Agent
 
                 return fileName;
             }
+        }
+
+        private static void MeasureCpuStats(string cpuStat, Job job)
+        {
+            // docker exec -it benchmarks_nodejs-2 cat /sys/fs/cgroup/cpu/cpu.stat
+
+            
+            // nr_periods 3
+            // nr_throttled 3
+            // throttled_time 258313264
+
+            long nrPeriods = 0, nrThrottled = 0, throttledTime = 0;
+
+            using (var sr = new StringReader(cpuStat))
+            {
+                var line = sr.ReadLine();
+
+                while (line != null)
+                {
+                    if (line.StartsWith("nr_periods"))
+                    {
+                        long.TryParse(line.Split(' ', 2, StringSplitOptions.RemoveEmptyEntries).Last(), out nrPeriods);
+                    }
+
+                    if (line.StartsWith("nr_throttled"))
+                    {
+                        long.TryParse(line.Split(' ', 2, StringSplitOptions.RemoveEmptyEntries).Last(), out nrThrottled);
+                    }
+
+                    if (line.StartsWith("throttled_time"))
+                    {
+                        long.TryParse(line.Split(' ', 2, StringSplitOptions.RemoveEmptyEntries).Last(), out throttledTime);
+                    }
+
+                    line = sr.ReadLine();
+                }
+            }
+
+            job.Measurements.Enqueue(new Measurement
+            {
+                Name = "benchmarks/cpu/periods/total",
+                Timestamp = DateTime.UtcNow,
+                Value = nrPeriods
+            });
+
+            job.Measurements.Enqueue(new Measurement
+            {
+                Name = "benchmarks/cpu/periods/throttled",
+                Timestamp = DateTime.UtcNow,
+                Value = nrThrottled
+            });
+
+            job.Measurements.Enqueue(new Measurement
+            {
+                Name = "benchmarks/cpu/throttled",
+                Timestamp = DateTime.UtcNow,
+                Value = throttledTime
+            });
+
         }
 
         private static async Task<long> GetSwapBytesAsync()
