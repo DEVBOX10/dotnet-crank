@@ -4,14 +4,14 @@ This tutorial shows how to store the results of a benchmark locally and in a SQL
 
 ### Local JSON files
 
-Use `--output [filename]` to store the results locally in JSON format. 
+Use `--json [filename]` to store the results locally in JSON format. 
 
 Some jobs can provide more information when the results are stored than on the console. For instance __bombardier__ will also provide detailed latency information that is not displayed by default.
 
 The following example executes the __hello__ sample benchmark and stores the results in a file named `results.json`. We assume the agent is running locally.
 
 ```
-crank --config /crank/samples/hello/hello.benchmarks.yml --scenario hello --profile local --output results.json 
+crank --config /crank/samples/hello/hello.benchmarks.yml --scenario hello --profile local --json results.json 
 ```
 
 And the file should contain some content similar to this:
@@ -113,7 +113,7 @@ Each service that is deployed gets an entry in the `jobResults.jobs` property. I
 
 Use `--sql [connection-string] --table [table-name]` arguments to store in the specified SQL Server database. The connection string must point to an existing SQL Server database. The first time it's called the required table will be created.
 
-The create table has the following schema:
+The created table has the following schema:
 
 
 | Column         | Type     | Example     | Description     |
@@ -125,3 +125,9 @@ The create table has the following schema:
 | Scenario | `nvarchard(200)` | hello | name of the scenario that was used |
 | Description | `nvarchard(200)` | custom string representing extra information about the job | |
 | Document | `nvarchar(max)` | { jobResults: {} } | json document containing the results of the job |
+
+### Elasticsearch
+
+Use `--es [server-url] --index [index-name]` arguments to store in the specified Elasticsearch server. The url must point to an existing Elasticsearch instance. The first time it's called the mapping of the required index will be created.
+
+The created index has the same set of fields as SqlServer

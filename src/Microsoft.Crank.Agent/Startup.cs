@@ -126,7 +126,7 @@ namespace Microsoft.Crank.Agent
         private static ManualResetEvent dotnetTraceManualReset;
 
         public static OperatingSystem OperatingSystem { get; }
-        public static Hardware Hardware { get; private set; }
+        public static string Hardware { get; private set; }
         public static string HardwareVersion { get; private set; }
 
         public static TimeSpan DriverTimeout = TimeSpan.FromSeconds(10);
@@ -220,7 +220,7 @@ namespace Microsoft.Crank.Agent
             var urlOption = app.Option("-u|--url", $"URL for Rest APIs.  Default is '{_defaultUrl}'.", CommandOptionType.SingleValue);
             var hostnameOption = app.Option("-n|--hostname", $"Hostname for benchmark server.  Default is '{_defaultHostname}'.", CommandOptionType.SingleValue);
             var dockerHostnameOption = app.Option("-nd|--docker-hostname", $"Hostname for benchmark server when running Docker on a different hostname.", CommandOptionType.SingleValue);
-            var hardwareOption = app.Option("--hardware", "Hardware (Cloud or Physical).", CommandOptionType.SingleValue);
+            var hardwareOption = app.Option("--hardware", "Hardware descriptor.", CommandOptionType.SingleValue);
             var dotnethomeOption = app.Option("--dotnethome", "Folder to reuse for sdk and runtime installs.", CommandOptionType.SingleValue);
             _relayConnectionStringOption = app.Option("--relay", "Connection string or environment variable name of the Azure Relay Hybrid Connection to listen to. e.g., Endpoint=sb://mynamespace.servicebus.windows.net;...", CommandOptionType.SingleValue);
             _relayPathOption = app.Option("--relay-path", "The hybrid connection name used to bind this agent. If not set the --relay argument must contain 'EntityPath={name}'", CommandOptionType.SingleValue);
@@ -270,13 +270,14 @@ namespace Microsoft.Crank.Agent
                 {
                     HardwareVersion = "Unspecified";
                 }
-                if (Enum.TryParse(hardwareOption.Value(), ignoreCase: true, result: out Hardware hardware))
+                
+                if (hardwareOption.HasValue())
                 {
-                    Hardware = hardware;
+                    Hardware = hardwareOption.Value();
                 }
                 else
                 {
-                    Hardware = Hardware.Unknown;
+                    Hardware = "Unspecified";
                 }
 
                 if (buildTimeoutOption.HasValue())
@@ -4123,7 +4124,7 @@ namespace Microsoft.Crank.Agent
 
                 case "net5.0":
 
-                    await DownloadFileAsync(String.Format(_aspNetCoreDependenciesUrl, "release/5.0/Versions.props"), aspNetCoreDependenciesPath, maxRetries: 5, timeout: 10);
+                    await DownloadFileAsync(String.Format(_aspNetCoreDependenciesUrl, "release/5.0/eng/Versions.props"), aspNetCoreDependenciesPath, maxRetries: 5, timeout: 10);
                     latestRuntimeVersion = XDocument.Load(aspNetCoreDependenciesPath).Root
                         .Elements("PropertyGroup")
                         .Select(x => x.Element("MicrosoftNETCoreAppRuntimewinx64PackageVersion"))
@@ -4135,7 +4136,7 @@ namespace Microsoft.Crank.Agent
 
                 case "net6.0":
 
-                    await DownloadFileAsync(String.Format(_aspNetCoreDependenciesUrl, "release/6.0/Versions.props"), aspNetCoreDependenciesPath, maxRetries: 5, timeout: 10);
+                    await DownloadFileAsync(String.Format(_aspNetCoreDependenciesUrl, "release/6.0/eng/Versions.props"), aspNetCoreDependenciesPath, maxRetries: 5, timeout: 10);
                     latestRuntimeVersion = XDocument.Load(aspNetCoreDependenciesPath).Root
                         .Elements("PropertyGroup")
                         .Select(x => x.Element("MicrosoftNETCoreAppRuntimewinx64PackageVersion"))
@@ -5155,7 +5156,7 @@ namespace Microsoft.Crank.Agent
                 if (Directory.Exists(dotnetMonoRootPath))
                 {
                     Log.Info("Deleting dotnet-mono folder...");
-                    Directory.Delete(dotnetMonoRootPath);
+                    Directory.Delete(dotnetMonoRootPath, true);
                 }
                 Log.Info("Creating dotnet-mono folder...");
                 Directory.CreateDirectory(dotnetMonoRootPath);
@@ -5196,7 +5197,7 @@ namespace Microsoft.Crank.Agent
 
                 if (Directory.Exists(llvmExtractDir))
                 {
-                    Directory.Delete(llvmExtractDir);
+                    Directory.Delete(llvmExtractDir, true);
                 }
 
                 Directory.CreateDirectory(llvmExtractDir);
