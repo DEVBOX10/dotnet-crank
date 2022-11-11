@@ -27,6 +27,7 @@ Options:
   --arguments "<first second third ...>" Any additional arguments to pass through to crank.
   --config <config> (REQUIRED)           The path to a configuration file.
   --version                              Show version information
+  --age                                  The age of the most recent comment to look for in minutes. Default is 60.
   -?, -h, --help                         Show help and usage information
 ```
 
@@ -43,4 +44,12 @@ The command format is `/benchmark <benchmarks[,...]> <profiles[,...]> <component
 
 ```
 dotnet run --config .\sample.config.yml --repository https://github.com/sebastienros/aspnetcore --publish-results true
+```
+
+Security:
+
+All arguments can be provided from an environment variable by prefixing the value with `env:`.
+
+```
+dotnet run --config .\sample.config.yml --access-token env:GITHUB_API_KEY 
 ```
