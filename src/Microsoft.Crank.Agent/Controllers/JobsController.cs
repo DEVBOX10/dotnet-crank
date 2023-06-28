@@ -332,6 +332,69 @@ namespace Microsoft.Crank.Agent.Controllers
             return Ok();
         }
 
+        [HttpPost("{id}/attachment/zip")]
+        [RequestSizeLimit(10_000_000_000)]
+        [RequestFormLimits(MultipartBodyLengthLimit = 10_000_000_000)]
+        public async Task<IActionResult> UploadAttachmentZip(int id)
+        {
+            // Because uploaded files can be big, the client is supposed to keep
+            // pinging the service to keep the job alive during the Initialize state.
+
+            var destinationFilename = Request.Headers["destinationFilename"].ToString();
+
+            Log.Info($"Uploading archive: {destinationFilename}");
+
+            var job = _jobs.Find(id);
+
+            if (job == null)
+            {
+                return NotFound("Job doesn't exist anymore");
+            }
+
+            if (job.State != JobState.Initializing)
+            {
+                Log.Info($"Attachment rejected, job is {job.State}");
+                return StatusCode(500, $"The job can't accept attachment as its state is {job.State}");
+            }
+
+            var destinationTempFilename = Path.GetFullPath(Path.GetRandomFileName(), Path.GetTempPath());
+
+            var tempFilename = Path.GetTempFileName() + ".zip";
+
+            await SaveBodyAsync(tempFilename);
+
+            job.LastDriverCommunicationUtc = DateTime.UtcNow;
+
+            try
+            {
+                // Extract the zip file in a temporary folder
+                ZipFile.ExtractToDirectory(tempFilename, destinationTempFilename);
+            }
+            finally
+            {
+                System.IO.File.Delete(tempFilename);
+            }
+
+            job.LastDriverCommunicationUtc = DateTime.UtcNow;
+
+            foreach (var file in Directory.GetFiles(destinationTempFilename, "*.*", SearchOption.AllDirectories))
+            {
+                var attachment = new Attachment
+                {
+                    TempFilename = file,
+                    Filename = Path.Combine(Path.GetDirectoryName(destinationFilename), file.Substring(destinationTempFilename.Length).TrimStart('/', '\\'))
+                };
+                
+                job.Attachments.Add(attachment);
+
+                Log.Info($"Creating attachment: {attachment.Filename}");
+            }
+
+            job.LastDriverCommunicationUtc = DateTime.UtcNow;
+
+            return Ok();
+        }
+
         [HttpPost("{id}/source")]
         [RequestSizeLimit(10_000_000_000)]
         [RequestFormLimits(MultipartBodyLengthLimit = 10_000_000_000)]
@@ -394,6 +457,7 @@ namespace Microsoft.Crank.Agent.Controllers
             }
             else
             {
+                Log.Info($"Received uncompressed file content");
                 await Request.Body.CopyToAsync(outputFileStream, Request.HttpContext.RequestAborted);
             }
         }
@@ -590,9 +654,28 @@ namespace Microsoft.Crank.Agent.Controllers
                     return NotFound();
                 }
 
-                var fullPath = Path.Combine(job.BasePath, path);
+                // Downloads can't get out of this path
+                var rootPath = Directory.GetParent(job.BasePath).FullName;
 
-                Log.Info($"Download requested: '{fullPath}'");
+                // Assume ~/ means relative to the project, otherwise it's relative to the application folder (job.BasePath)
+                var isRelativeToProject = String.IsNullOrEmpty(job.Source.DockerFile) && (path.StartsWith("~/") || path.StartsWith("~\\"));
+                
+                if (isRelativeToProject)
+                {
+                    // One level up from the output folder
+                    path = string.Concat("..", path.AsSpan(1));
+                }
+
+                // Resolve dot notation in path
+                var fullPath = Path.GetFullPath(path, job.BasePath);
+
+                Log.Info($"Download requested: '{path}'");
+
+                if (!fullPath.StartsWith(rootPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    Log.Error($"Client is not allowed to download '{fullPath}'");
+                    return BadRequest("Attempts to access a path outside of the job.");
+                }
 
                 if (String.IsNullOrEmpty(job.Source.DockerFile))
                 {
@@ -645,13 +728,33 @@ namespace Microsoft.Crank.Agent.Controllers
                     return NotFound();
                 }
 
-                var fullPath = Path.Combine(job.BasePath, path);
+                // Downloads can't get out of this path
+                var rootPath = Directory.GetParent(job.BasePath).FullName;
+
+                // Assume ~/ means relative to the project, otherwise it's relative to the application folder (job.BasePath)
+                var isRelativeToProject = String.IsNullOrEmpty(job.Source.DockerFile) && (path.StartsWith("~/") || path.StartsWith("~\\"));
+
+                if (isRelativeToProject)
+                {
+                    // One level up from the output folder
+                    path = string.Concat("..", path.AsSpan(1));
+                }
+
+                // Resolve dot notation in path
+                var fullPath = Path.GetFullPath(path, job.BasePath);
+
+                if (!fullPath.StartsWith(rootPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    Log.Error($"Client is not allowed to list '{fullPath}'");
+                    return BadRequest("Attempts to access a path outside of the job.");
+                }
 
                 if (!Directory.Exists(Path.GetDirectoryName(fullPath)))
                 {
                     return Json(Array.Empty<string>());
                 }
 
+                // Returned paths are relative to the job.BasePath folder (e.g., /published in case of dotnet projects)
                 if (fullPath.Contains("*"))
                 {
                     return Json(

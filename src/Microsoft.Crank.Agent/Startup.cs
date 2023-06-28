@@ -68,10 +68,11 @@ namespace Microsoft.Crank.Agent
         private static readonly string DefaultTargetFramework = "net6.0";
         private static readonly string DefaultChannel = "current";
 
-        private const string PerfViewVersion = "P2.0.68";
+        private const string PerfViewVersion = "v3.0.7";
 
         private static readonly HttpClient _httpClient;
         private static readonly HttpClientHandler _httpClientHandler;
+        private static readonly char[] _splitChars = { ' ', '=', '"' };
 
         // Sources of dotnet-install scripts are in https://github.com/dotnet/install-scripts/
         private static readonly string _dotnetInstallShUrl = "https://dot.net/v1/dotnet-install.sh";
@@ -112,6 +113,7 @@ namespace Microsoft.Crank.Agent
         private static readonly HashSet<string> _ignoredDesktopRuntimes = new(StringComparer.OrdinalIgnoreCase);
         private static readonly HashSet<string> _installedSdks = new(StringComparer.OrdinalIgnoreCase);
 
+        private static readonly string[] _ignoredSymbolsExtensions = new string[] { ".dbg", ".pdb" };
         private const string _defaultUrl = "http://*:5010";
         private static readonly string _defaultHostname = Dns.GetHostName();
         private static string _perfviewPath;
@@ -571,6 +573,12 @@ namespace Microsoft.Crank.Agent
                             {
                                 continue;
                             }
+                            
+                            var realCpuCount = Environment.ProcessorCount;
+                            if (!string.IsNullOrEmpty(job.CpuSet))
+                            {
+                                realCpuCount = CalculateCpuList(job.CpuSet).Count;
+                            }
 
                             var context = group[job];
 
@@ -653,68 +661,68 @@ namespace Microsoft.Crank.Agent
 
                                 lock (job.Metadata)
                                 {
-                                    if (!job.Metadata.Any(x => x.Name == "benchmarks/cpu"))
+                                    if (!job.Metadata.Any(x => x.Name == Measurements.BenchmarksCpu))
                                     {
                                         job.Metadata.Enqueue(new MeasurementMetadata
                                         {
                                             Source = "Host Process",
-                                            Name = "benchmarks/cpu",
+                                            Name = Measurements.BenchmarksCpu,
                                             Aggregate = Operation.Max,
                                             Reduce = Operation.Max,
                                             Format = "n0",
                                             LongDescription = "Amount of time the process has utilized the CPU out of 100%",
-                                            ShortDescription = "CPU Usage (%)"
+                                            ShortDescription = "Max CPU Usage (%)"
                                         });
                                     }
 
-                                    if (!job.Metadata.Any(x => x.Name == "benchmarks/cpu/raw"))
+                                    if (!job.Metadata.Any(x => x.Name == Measurements.BenchmarksCpuRaw))
                                     {
                                         job.Metadata.Enqueue(new MeasurementMetadata
                                         {
                                             Source = "Host Process",
-                                            Name = "benchmarks/cpu/raw",
+                                            Name = Measurements.BenchmarksCpuRaw,
                                             Aggregate = Operation.Max,
                                             Reduce = Operation.Max,
                                             Format = "n0",
                                             LongDescription = "Raw CPU value (not normalized by number of cores)",
-                                            ShortDescription = "Cores usage (%)"
+                                            ShortDescription = "Max Cores usage (%)"
                                         });
                                     }
 
-                                    if (!job.Metadata.Any(x => x.Name == "benchmarks/working-set"))
+                                    if (!job.Metadata.Any(x => x.Name == Measurements.BenchmarksWorkingSet))
                                     {
                                         job.Metadata.Enqueue(new MeasurementMetadata
                                         {
                                             Source = "Host Process",
-                                            Name = "benchmarks/working-set",
+                                            Name = Measurements.BenchmarksWorkingSet,
                                             Aggregate = Operation.Max,
                                             Reduce = Operation.Max,
                                             Format = "n0",
                                             LongDescription = "Amount of working set used by the process (MB)",
-                                            ShortDescription = "Working Set (MB)"
+                                            ShortDescription = "Max Working Set (MB)"
                                         });
                                     }
 
-                                    if (!job.Metadata.Any(x => x.Name == "benchmarks/private-memory"))
+                                    if (!job.Metadata.Any(x => x.Name == Measurements.BenchmarksPrivateMemory))
                                     {
                                         job.Metadata.Enqueue(new MeasurementMetadata
                                         {
                                             Source = "Host Process",
-                                            Name = "benchmarks/private-memory",
+                                            Name = Measurements.BenchmarksPrivateMemory,
                                             Aggregate = Operation.Max,
                                             Reduce = Operation.Max,
                                             Format = "n0",
                                             LongDescription = "Amount of private memory used by the process (MB)",
-                                            ShortDescription = "Private Memory (MB)"
+                                            ShortDescription = "Max Private Memory (MB)"
                                         });
                                     }
 
-                                    if (!job.Metadata.Any(x => x.Name == "benchmarks/build-time"))
+                                    if (!job.Metadata.Any(x => x.Name == Measurements.BenchmarksBuildTime))
                                     {
                                         job.Metadata.Enqueue(new MeasurementMetadata
                                         {
                                             Source = "Host Process",
-                                            Name = "benchmarks/build-time",
+                                            Name = Measurements.BenchmarksBuildTime,
                                             Aggregate = Operation.Max,
                                             Reduce = Operation.Max,
                                             Format = "n0",
@@ -723,12 +731,12 @@ namespace Microsoft.Crank.Agent
                                         });
                                     }
 
-                                    if (!job.Metadata.Any(x => x.Name == "benchmarks/start-time"))
+                                    if (!job.Metadata.Any(x => x.Name == Measurements.BenchmarksStartTime))
                                     {
                                         job.Metadata.Enqueue(new MeasurementMetadata
                                         {
                                             Source = "Host Process",
-                                            Name = "benchmarks/start-time",
+                                            Name = Measurements.BenchmarksStartTime,
                                             Aggregate = Operation.Max,
                                             Reduce = Operation.Max,
                                             Format = "n0",
@@ -737,12 +745,12 @@ namespace Microsoft.Crank.Agent
                                         });
                                     }
 
-                                    if (!job.Metadata.Any(x => x.Name == "benchmarks/published-size"))
+                                    if (!job.Metadata.Any(x => x.Name == Measurements.BenchmarksPublishedSize))
                                     {
                                         job.Metadata.Enqueue(new MeasurementMetadata
                                         {
                                             Source = "Host Process",
-                                            Name = "benchmarks/published-size",
+                                            Name = Measurements.BenchmarksPublishedSize,
                                             Aggregate = Operation.Max,
                                             Reduce = Operation.Max,
                                             Format = "n0",
@@ -751,13 +759,26 @@ namespace Microsoft.Crank.Agent
                                         });
                                     }
 
-
-                                    if (!job.Metadata.Any(x => x.Name == "benchmarks/memory/swap"))
+                                    if (!job.Metadata.Any(x => x.Name == Measurements.BenchmarksSymbolsSize))
                                     {
                                         job.Metadata.Enqueue(new MeasurementMetadata
                                         {
                                             Source = "Host Process",
-                                            Name = "benchmarks/memory/swap",
+                                            Name = Measurements.BenchmarksSymbolsSize,
+                                            Aggregate = Operation.Max,
+                                            Reduce = Operation.Max,
+                                            Format = "n0",
+                                            LongDescription = "The size of the published symbols (KB)",
+                                            ShortDescription = "Symbols Size (KB)"
+                                        });
+                                    }
+
+                                    if (!job.Metadata.Any(x => x.Name == Measurements.BenchmarksMemorySwap))
+                                    {
+                                        job.Metadata.Enqueue(new MeasurementMetadata
+                                        {
+                                            Source = "Host Process",
+                                            Name = Measurements.BenchmarksMemorySwap,
                                             Aggregate = Operation.Delta,
                                             Reduce = Operation.Avg,
                                             Format = "n0",
@@ -766,12 +787,12 @@ namespace Microsoft.Crank.Agent
                                         });
                                     }
 
-                                    if (!job.Metadata.Any(x => x.Name == "benchmarks/cpu/periods/total"))
+                                    if (!job.Metadata.Any(x => x.Name == Measurements.BenchmarksCpuPeriodsTotal))
                                     {
                                         job.Metadata.Enqueue(new MeasurementMetadata
                                         {
                                             Source = "Host Process",
-                                            Name = "benchmarks/cpu/periods/total",
+                                            Name = Measurements.BenchmarksCpuPeriodsTotal,
                                             Aggregate = Operation.Max,
                                             Reduce = Operation.Sum,
                                             Format = "n0",
@@ -780,12 +801,12 @@ namespace Microsoft.Crank.Agent
                                         });
                                     }
 
-                                    if (!job.Metadata.Any(x => x.Name == "benchmarks/cpu/periods/throttled"))
+                                    if (!job.Metadata.Any(x => x.Name == Measurements.BenchmarksCpuPeriodsThrottled))
                                     {
                                         job.Metadata.Enqueue(new MeasurementMetadata
                                         {
                                             Source = "Host Process",
-                                            Name = "benchmarks/cpu/periods/throttled",
+                                            Name = Measurements.BenchmarksCpuPeriodsThrottled,
                                             Aggregate = Operation.Max,
                                             Reduce = Operation.Sum,
                                             Format = "n0",
@@ -794,12 +815,12 @@ namespace Microsoft.Crank.Agent
                                         });
                                     }
 
-                                    if (!job.Metadata.Any(x => x.Name == "benchmarks/cpu/throttled"))
+                                    if (!job.Metadata.Any(x => x.Name == Measurements.BenchmarksCpuThrottled))
                                     {
                                         job.Metadata.Enqueue(new MeasurementMetadata
                                         {
                                             Source = "Host Process",
-                                            Name = "benchmarks/cpu/throttled",
+                                            Name = Measurements.BenchmarksCpuThrottled,
                                             Aggregate = Operation.Max,
                                             Reduce = Operation.Sum,
                                             Format = "n0",
@@ -1035,7 +1056,7 @@ namespace Microsoft.Crank.Agent
                                                                     // On Windows the CPU already takes the number or HT into account
                                                                     if (OperatingSystem == OperatingSystem.Linux)
                                                                     {
-                                                                        cpu = cpu / Environment.ProcessorCount;
+                                                                        cpu = cpu / realCpuCount;
                                                                     }
 
                                                                     cpu = Math.Round(cpu);
@@ -1063,21 +1084,21 @@ namespace Microsoft.Crank.Agent
 
                                                                     job.Measurements.Enqueue(new Measurement
                                                                     {
-                                                                        Name = "benchmarks/working-set",
+                                                                        Name = Measurements.BenchmarksWorkingSet,
                                                                         Timestamp = now,
                                                                         Value = Math.Ceiling((double)workingSet / 1024 / 1024) // < 1MB still needs to appear as 1MB
                                                                     });
 
                                                                     job.Measurements.Enqueue(new Measurement
                                                                     {
-                                                                        Name = "benchmarks/cpu",
+                                                                        Name = Measurements.BenchmarksCpu,
                                                                         Timestamp = now,
                                                                         Value = cpu
                                                                     });
 
                                                                     job.Measurements.Enqueue(new Measurement
                                                                     {
-                                                                        Name = "benchmarks/cpu/raw",
+                                                                        Name = Measurements.BenchmarksCpuRaw,
                                                                         Timestamp = now,
                                                                         Value = Math.Round(rawCpu)
                                                                     });
@@ -1088,7 +1109,7 @@ namespace Microsoft.Crank.Agent
                                                                         {
                                                                             job.Measurements.Enqueue(new Measurement
                                                                             {
-                                                                                Name = "benchmarks/memory/swap",
+                                                                                Name = Measurements.BenchmarksMemorySwap,
                                                                                 Timestamp = now,
                                                                                 Value = GetSwapBytesAsync().GetAwaiter().GetResult() / 1024 / 1024
                                                                             });
@@ -1179,7 +1200,7 @@ namespace Microsoft.Crank.Agent
                                                                                                                         
                                                                 var elapsed = now.Subtract(lastMonitorTime).TotalMilliseconds;
                                                                 var rawCpu = (newCPUTime - oldCPUTime).TotalMilliseconds / elapsed * 100;
-                                                                var cpu = Math.Round(rawCpu / Environment.ProcessorCount);
+                                                                var cpu = Math.Round(rawCpu / realCpuCount);
                                                                 lastMonitorTime = now;
 
                                                                 // Ignore first measure
@@ -1187,28 +1208,28 @@ namespace Microsoft.Crank.Agent
                                                                 {
                                                                     job.Measurements.Enqueue(new Measurement
                                                                     {
-                                                                        Name = "benchmarks/working-set",
+                                                                        Name = Measurements.BenchmarksWorkingSet,
                                                                         Timestamp = now,
                                                                         Value = Math.Ceiling((double)trackProcess.WorkingSet64 / 1024 / 1024) // < 1MB still needs to appear as 1MB
                                                                     });
 
                                                                     job.Measurements.Enqueue(new Measurement
                                                                     {
-                                                                        Name = "benchmarks/private-memory",
+                                                                        Name = Measurements.BenchmarksPrivateMemory,
                                                                         Timestamp = now,
                                                                         Value = Math.Ceiling((double)trackProcess.PrivateMemorySize64 / 1024 / 1024) // < 1MB still needs to appear as 1MB
                                                                     });
 
                                                                     job.Measurements.Enqueue(new Measurement
                                                                     {
-                                                                        Name = "benchmarks/cpu",
+                                                                        Name = Measurements.BenchmarksCpu,
                                                                         Timestamp = now,
                                                                         Value = cpu
                                                                     });
 
                                                                     job.Measurements.Enqueue(new Measurement
                                                                     {
-                                                                        Name = "benchmarks/cpu/raw",
+                                                                        Name = Measurements.BenchmarksCpuRaw,
                                                                         Timestamp = now,
                                                                         Value = Math.Round(rawCpu)
                                                                     });
@@ -1219,7 +1240,7 @@ namespace Microsoft.Crank.Agent
                                                                         {
                                                                             job.Measurements.Enqueue(new Measurement
                                                                             {
-                                                                                Name = "benchmarks/memory/swap",
+                                                                                Name = Measurements.BenchmarksMemorySwap,
                                                                                 Timestamp = now,
                                                                                 Value = GetSwapBytesAsync().GetAwaiter().GetResult() / 1024 / 1024
                                                                             });
@@ -1443,7 +1464,7 @@ namespace Microsoft.Crank.Agent
                                     job.DumpFile = Path.GetTempFileName();
 
                                     var dumper = new Dumper();
-                                    dumper.Collect(job.ChildProcessId > 0 ? job.ChildProcessId : job.ProcessId, job.DumpFile, job.DumpType);
+                                    dumper.Collect(job.TrackedProcessId, job.DumpFile, job.DumpType);
                                 }
 
                                 Log.Info($"Stopping heartbeat ({job.Service}:{job.Id})");
@@ -1465,6 +1486,19 @@ namespace Microsoft.Crank.Agent
                                     context.Disposed = true;
 
                                     Monitor.Exit(_synLock);
+                                }
+
+                                // Execute custom script
+                                if (!String.IsNullOrEmpty(job.StoppingScript))
+                                {
+                                    var environmentVariables = new Dictionary<string, string>()
+                                    {
+                                        ["CRANK_PROCESS_ID"] = job.TrackedProcessId.ToString(),
+                                        ["CRANK_WORKING_DIRECTORY"] = workingDirectory
+                                    };
+
+                                    var segments = job.StoppingScript.Split(' ', 2);
+                                    var processResult = await ProcessUtil.RunAsync(segments[0], segments.Length > 1 ? segments[1] : "", log: true, workingDirectory: workingDirectory, environmentVariables: environmentVariables, cancellationToken: cancellationToken);
                                 }
 
                                 // Delete the benchmarks group
@@ -1655,11 +1689,17 @@ namespace Microsoft.Crank.Agent
                                     await DockerCleanUpAsync(dockerContainerId, dockerImage, job);
                                 }
 
-                                // Running AfterScript
+                                // Run scripts after the benchmark is stopped
                                 if (!String.IsNullOrEmpty(job.AfterScript))
                                 {
+                                    var environmentVariables = new Dictionary<string, string>()
+                                    {
+                                        ["CRANK_PROCESS_ID"] = job.TrackedProcessId.ToString(),
+                                        ["CRANK_WORKING_DIRECTORY"] = workingDirectory
+                                    };
+
                                     var segments = job.AfterScript.Split(' ', 2);
-                                    var processResult = await ProcessUtil.RunAsync(segments[0], segments.Length > 1 ? segments[1] : "", log: true, workingDirectory: workingDirectory);
+                                    var processResult = await ProcessUtil.RunAsync(segments[0], segments.Length > 1 ? segments[1] : "", log: true, workingDirectory: workingDirectory, environmentVariables: environmentVariables);
 
                                     // TODO: Update the output with the result of AfterScript, and change the driver so that it polls the job a last time even when the job is stopped
                                     // if there is an AfterScript
@@ -1670,25 +1710,39 @@ namespace Microsoft.Crank.Agent
 
                             async Task DeleteJobAsync()
                             {
-                                await StopJobAsync(abortCollection: true);
-
-                                if (_cleanup && !job.NoClean && String.IsNullOrEmpty(job.Source.SourceKey) && tempDir != null)
+                                try
                                 {
-                                    // Delete traces
-
-                                    TryDeleteFile(job.DumpFile);
-                                    TryDeleteFile(job.PerfViewTraceFile);
-
-                                    // Delete application folder
-
-                                    await TryDeleteDirAsync(tempDir, false);
+                                    await StopJobAsync(abortCollection: true);
                                 }
+                                finally
+                                {
+                                    if (_cleanup && !job.NoClean && String.IsNullOrEmpty(job.Source.SourceKey) && tempDir != null)
+                                    {
+                                        // Delete traces
 
-                                tempDir = null;
+                                        TryDeleteFile(job.DumpFile);
+                                        TryDeleteFile(job.PerfViewTraceFile);
 
-                                Log.Info($"{job.State} -> Deleted ({job.Service}:{job.Id})");
+                                        // Delete application folder
 
-                                job.State = JobState.Deleted;
+                                        await TryDeleteDirAsync(tempDir);
+                                    }
+
+                                    // Delete temporary attachment files
+                                    // NB: Attachments are already deleted once they are copied, unless the job fails
+                                    // to reach that point.
+
+                                    foreach (var attachment in job.Attachments)
+                                    {
+                                        TryDeleteFile(attachment.TempFilename);
+                                    }
+
+                                    tempDir = null;
+
+                                    Log.Info($"{job.State} -> Deleted ({job.Service}:{job.Id})");
+
+                                    job.State = JobState.Deleted;
+                                }
                             }
 
                             // Store context for the current job
@@ -1995,13 +2049,6 @@ namespace Microsoft.Crank.Agent
 
             job.BasePath = workingDirectory;
 
-            // Running BeforeScript
-            if (!String.IsNullOrEmpty(job.BeforeScript))
-            {
-                var segments = job.BeforeScript.Split(' ', 2);
-                var processResult = await ProcessUtil.RunAsync(segments[0], segments.Length > 1 ? segments[1] : "", workingDirectory: workingDirectory, log: true, outputDataReceived: text => job.Output.AddLine(text));
-            }
-
             // Copy build files before building/publishing
             foreach (var attachment in job.BuildAttachments)
             {
@@ -2059,7 +2106,7 @@ namespace Microsoft.Crank.Agent
 
                     job.Measurements.Enqueue(new Measurement
                     {
-                        Name = "benchmarks/build-time",
+                        Name = Measurements.BenchmarksBuildTime,
                         Timestamp = DateTime.UtcNow,
                         Value = stopwatch.ElapsedMilliseconds
                     });
@@ -2088,7 +2135,7 @@ namespace Microsoft.Crank.Agent
 
                             job.Measurements.Enqueue(new Measurement
                             {
-                                Name = "benchmarks/published-size",
+                                Name = Measurements.BenchmarksPublishedSize,
                                 Timestamp = DateTime.UtcNow,
                                 Value = imageSize / 1024
                             });
@@ -2110,6 +2157,18 @@ namespace Microsoft.Crank.Agent
                         outputDataReceived: text => job.BuildLog.AddLine(text)
                     );
                 }
+            }
+
+            // Run scripts before the benchmark is run, and after custom build attachments have be uploaded
+            if (!String.IsNullOrEmpty(job.BeforeScript))
+            {
+                var environmentVariables = new Dictionary<string, string>()
+                {
+                    ["CRANK_WORKING_DIRECTORY"] = workingDirectory
+                };
+
+                var segments = job.BeforeScript.Split(' ', 2);
+                var processResult = await ProcessUtil.RunAsync(segments[0], segments.Length > 1 ? segments[1] : "", workingDirectory: workingDirectory, log: true, outputDataReceived: job.Output.AddLine, environmentVariables: environmentVariables);
             }
 
             if (cancellationToken.IsCancellationRequested)
@@ -2634,8 +2693,8 @@ namespace Microsoft.Crank.Agent
             {
                 channel = job.Channel;
             }
-            // Until there is a GA version of net7.0 or net8.0, use "edge"
-            else if (targetFramework.Equals("net7.0") || targetFramework.Equals("net8.0"))
+            // Until there is a GA version of net8.0, use "edge"
+            else if (targetFramework.Equals("net8.0"))
             {
                 channel = "edge";
             }
@@ -2696,22 +2755,27 @@ namespace Microsoft.Crank.Agent
 
                         // Install latest SDK version (and associated runtime)
 
-                        if (!TryGetAzureFeedForPackage(PackageTypes.Sdk, sdkVersion, out dotnetFeed))
+                        ProcessResult result = null;
+                        
+                        await ProcessUtil.RetryOnExceptionAsync(3, async () =>
                         {
-                            throw new InvalidOperationException();
-                        }
+                            if (!TryGetAzureFeedForPackage(PackageTypes.Sdk, sdkVersion, out dotnetFeed))
+                            {
+                                throw new InvalidOperationException();
+                            }
 
-                        ProcessResult result = await ProcessUtil.RunAsync("powershell", $"-NoProfile -ExecutionPolicy unrestricted [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; .\\dotnet-install.ps1 -Version {sdkVersion} -NoPath -SkipNonVersionedFiles -InstallDir {dotnetHome} -AzureFeed {dotnetFeed}",
-                            log: false,
-                            throwOnError: false, 
-                            workingDirectory: _dotnetInstallPath,
-                            environmentVariables: env,
-                            cancellationToken: cancellationToken);
+                            result = await ProcessUtil.RunAsync("powershell", $"-NoProfile -ExecutionPolicy unrestricted [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; .\\dotnet-install.ps1 -Version {sdkVersion} -NoPath -SkipNonVersionedFiles -InstallDir {dotnetHome} -AzureFeed {dotnetFeed}",
+                                log: false,
+                                throwOnError: false, 
+                                workingDirectory: _dotnetInstallPath,
+                                environmentVariables: env,
+                                cancellationToken: cancellationToken);
 
-                        if (result.ExitCode != 0)
-                        {
-                            throw new InvalidOperationException();
-                        }
+                            if (result.ExitCode != 0)
+                            {
+                                throw new InvalidOperationException();
+                            }
+                        });
 
                         _installedSdks.Add(sdkVersion);
                     }
@@ -2832,22 +2896,27 @@ namespace Microsoft.Crank.Agent
 
                         // Install latest SDK version (and associated runtime)
 
-                        if (!TryGetAzureFeedForPackage(PackageTypes.Sdk, sdkVersion, out dotnetFeed))
+                        ProcessResult result = null;
+                        
+                        await ProcessUtil.RetryOnExceptionAsync(3, async () =>
                         {
-                            throw new InvalidOperationException();
-                        }
+                            if (!TryGetAzureFeedForPackage(PackageTypes.Sdk, sdkVersion, out dotnetFeed))
+                            {
+                                throw new InvalidOperationException();
+                            }
 
-                        ProcessResult result = await ProcessUtil.RunAsync("/usr/bin/env", $"bash dotnet-install.sh --version {sdkVersion} --no-path --skip-non-versioned-files --install-dir {dotnetHome} -AzureFeed {dotnetFeed}",
-                                log: false,
-                                throwOnError: false, 
-                                workingDirectory: _dotnetInstallPath,
-                                environmentVariables: env,
-                                cancellationToken: cancellationToken);
+                            result = await ProcessUtil.RunAsync("/usr/bin/env", $"bash dotnet-install.sh --version {sdkVersion} --no-path --skip-non-versioned-files --install-dir {dotnetHome} -AzureFeed {dotnetFeed}",
+                                    log: false,
+                                    throwOnError: false, 
+                                    workingDirectory: _dotnetInstallPath,
+                                    environmentVariables: env,
+                                    cancellationToken: cancellationToken);
 
-                        if (result.ExitCode != 0)
-                        {
-                            throw new InvalidOperationException();
-                        }
+                            if (result.ExitCode != 0)
+                            {
+                                throw new InvalidOperationException();
+                            }
+                        });
 
                         _installedSdks.Add(sdkVersion);
                     }
@@ -2928,12 +2997,12 @@ namespace Microsoft.Crank.Agent
             job.DesktopVersion = desktopVersion;
             job.SdkVersion = sdkVersion;
 
-            if (!job.Metadata.Any(x => x.Name == "netSdkVersion"))
+            if (!job.Metadata.Any(x => x.Name == Measurements.BenchmarksNetSdkVersion))
             {
                 job.Metadata.Enqueue(new MeasurementMetadata
                 {
                     Source = "Host Process",
-                    Name = "netSdkVersion",
+                    Name = Measurements.BenchmarksNetSdkVersion,
                     Aggregate = Operation.First, // Use first as iterations won't repeat it in next runs
                     Reduce = Operation.First,
                     Format = "",
@@ -2943,7 +3012,7 @@ namespace Microsoft.Crank.Agent
 
                 job.Measurements.Enqueue(new Measurement
                 {
-                    Name = "netSdkVersion",
+                    Name = Measurements.BenchmarksNetSdkVersion,
                     Timestamp = DateTime.UtcNow,
                     Value = sdkVersion
                 });
@@ -2951,7 +3020,7 @@ namespace Microsoft.Crank.Agent
 
             var knownDependencies = new List<Dependency>();
 
-            if (!job.Metadata.Any(x => x.Name == "AspNetCoreVersion"))
+            if (!job.Metadata.Any(x => x.Name == Measurements.BenchmarksAspNetCoreVersion))
             {
                 try
                 {
@@ -2961,7 +3030,7 @@ namespace Microsoft.Crank.Agent
                     job.Metadata.Enqueue(new MeasurementMetadata
                     {
                         Source = "Host Process",
-                        Name = "AspNetCoreVersion",
+                        Name = Measurements.BenchmarksAspNetCoreVersion,
                         Aggregate = Operation.First, // Use first as iterations won't repeat it in next runs
                         Reduce = Operation.First,
                         Format = "",
@@ -2971,7 +3040,7 @@ namespace Microsoft.Crank.Agent
 
                     job.Measurements.Enqueue(new Measurement
                     {
-                        Name = "AspNetCoreVersion",
+                        Name = Measurements.BenchmarksAspNetCoreVersion,
                         Timestamp = DateTime.UtcNow,
                         Value = $"{aspNetCoreVersion}+{aspnetCoreCommitHash.Substring(0, 7)}"
                     });
@@ -2984,7 +3053,7 @@ namespace Microsoft.Crank.Agent
                 }
             }
 
-            if (!job.Metadata.Any(x => x.Name == "NetCoreAppVersion"))
+            if (!job.Metadata.Any(x => x.Name == Measurements.BenchmarksNetCoreAppVersion))
             {
                 try
                 {
@@ -2994,7 +3063,7 @@ namespace Microsoft.Crank.Agent
                     job.Metadata.Enqueue(new MeasurementMetadata
                     {
                         Source = "Host Process",
-                        Name = "NetCoreAppVersion",
+                        Name = Measurements.BenchmarksNetCoreAppVersion,
                         Aggregate = Operation.First, // Use first as iterations won't repeat it in next runs
                         Reduce = Operation.First,
                         Format = "",
@@ -3004,7 +3073,7 @@ namespace Microsoft.Crank.Agent
 
                     job.Measurements.Enqueue(new Measurement
                     {
-                        Name = "NetCoreAppVersion",
+                        Name = Measurements.BenchmarksNetCoreAppVersion,
                         Timestamp = DateTime.UtcNow,
                         Value = $"{runtimeVersion}+{netCoreAppCommitHash.Substring(0, 7)}"
                     });
@@ -3022,15 +3091,9 @@ namespace Microsoft.Crank.Agent
 
             var buildParameters =
                 $"/p:MicrosoftNETCoreAppPackageVersion={runtimeVersion} " +
-                $"/p:MicrosoftAspNetCoreAppPackageVersion={aspNetCoreVersion} "
-                // The following properties could be removed in a future version
-                //$"/p:BenchmarksNETStandardImplicitPackageVersion={aspNetCoreVersion} " +
-                //$"/p:BenchmarksNETCoreAppImplicitPackageVersion={aspNetCoreVersion} " +
-                //$"/p:BenchmarksRuntimeFrameworkVersion={runtimeVersion} " +
-                //$"/p:BenchmarksTargetFramework={targetFramework} " +
-                //$"/p:BenchmarksAspNetCoreVersion={aspNetCoreVersion} " +
-                //$"/p:MicrosoftAspNetCoreAllPackageVersion={aspNetCoreVersion} " +
-                //$"/p:NETCoreAppMaximumVersion=99.9 "; // Force the SDK to accept the TFM even if it's an unknown one. For instance using SDK 2.1 to build a netcoreapp2.2 TFM.
+                $"/p:MicrosoftAspNetCoreAppPackageVersion={aspNetCoreVersion} " +
+                $"/p:GenerateErrorForMissingTargetingPacks=false " +
+                $"/p:RestoreNoCache=true " // https://github.com/aspnet/Benchmarks/issues/1445 force no cache for restore to avoid restore failures for packages published within last 30 minutes
                 ;
 
             if (OperatingSystem == OperatingSystem.Windows)
@@ -3038,55 +3101,10 @@ namespace Microsoft.Crank.Agent
                 buildParameters += $"/p:MicrosoftWindowsDesktopAppPackageVersion={desktopVersion} ";
             }
 
-            if (targetFramework == "netcoreapp2.1")
+            if (!job.UseRuntimeStore)
             {
-                buildParameters += $"/p:MicrosoftNETCoreApp21PackageVersion={runtimeVersion} ";
-                if (!job.UseRuntimeStore)
-                {
-                    buildParameters += $"/p:MicrosoftNETPlatformLibrary=Microsoft.NETCore.App ";
-                }
+                buildParameters += $"/p:MicrosoftNETPlatformLibrary=Microsoft.NETCore.App ";
             }
-            else if (targetFramework == "netcoreapp2.2")
-            {
-                buildParameters += $"/p:MicrosoftNETCoreApp22PackageVersion={runtimeVersion} ";
-                if (!job.UseRuntimeStore)
-                {
-                    buildParameters += $"/p:MicrosoftNETPlatformLibrary=Microsoft.NETCore.App ";
-                }
-            }
-            else if (targetFramework == "netcoreapp3.0")
-            {
-                buildParameters += $"/p:MicrosoftNETCoreApp30PackageVersion={runtimeVersion} ";
-                if (!job.UseRuntimeStore)
-                {
-                    buildParameters += $"/p:MicrosoftNETPlatformLibrary=Microsoft.NETCore.App ";
-                }
-            }
-            else if (targetFramework == "netcoreapp3.1")
-            {
-                buildParameters += $"/p:MicrosoftNETCoreApp31PackageVersion={runtimeVersion} ";
-                if (!job.UseRuntimeStore)
-                {
-                    buildParameters += $"/p:MicrosoftNETPlatformLibrary=Microsoft.NETCore.App ";
-                }
-            }
-            else if (targetFramework == "net5.0" || targetFramework == "net6.0" || targetFramework == "net7.0" || targetFramework == "net8.0")
-            {
-                buildParameters += $"/p:MicrosoftNETCoreApp50PackageVersion={runtimeVersion} ";
-                buildParameters += $"/p:GenerateErrorForMissingTargetingPacks=false ";
-                if (!job.UseRuntimeStore)
-                {
-                    buildParameters += $"/p:MicrosoftNETPlatformLibrary=Microsoft.NETCore.App ";
-                }
-            }
-            else
-            {
-                job.Error = $"Unsupported framework: {targetFramework}";
-                return null;
-            }
-
-            // #1445 force no cache for restore to avoid restore failures for packages published within last 30 minutes
-            buildParameters += "/p:RestoreNoCache=true ";
 
             // Apply custom build arguments sent from the driver
             foreach (var argument in job.BuildArguments)
@@ -3148,7 +3166,7 @@ namespace Microsoft.Crank.Agent
                     workingDirectory: benchmarkedApp,
                     environmentVariables: env,
                     throwOnError: false,
-                    outputDataReceived: text => job.BuildLog.AddLine(text),
+                    outputDataReceived: job.BuildLog.AddLine,
                     cancellationToken: cancellationToken
                     );
 
@@ -3171,7 +3189,7 @@ namespace Microsoft.Crank.Agent
 
                 job.Measurements.Enqueue(new Measurement
                 {
-                    Name = "benchmarks/build-time",
+                    Name = Measurements.BenchmarksBuildTime,
                     Timestamp = DateTime.UtcNow,
                     Value = stopwatch.ElapsedMilliseconds
                 });
@@ -3189,9 +3207,21 @@ namespace Microsoft.Crank.Agent
 
                 job.Measurements.Enqueue(new Measurement
                 {
-                    Name = "benchmarks/published-size",
+                    Name = Measurements.BenchmarksPublishedSize,
                     Timestamp = DateTime.UtcNow,
                     Value = publishedSize
+                });
+            }
+
+            var publishedSizeWithoutSymbols = DirSize(new DirectoryInfo(outputFolder), _ignoredSymbolsExtensions) / 1024;
+
+            if (publishedSize != 0 && publishedSizeWithoutSymbols != 0)
+            {
+                job.Measurements.Enqueue(new Measurement
+                {
+                    Name = Measurements.BenchmarksSymbolsSize,
+                    Timestamp = DateTime.UtcNow,
+                    Value = publishedSize - publishedSizeWithoutSymbols
                 });
             }
 
@@ -3354,13 +3384,18 @@ namespace Microsoft.Crank.Agent
                 }
             }
 
-            long DirSize(DirectoryInfo d)
+            long DirSize(DirectoryInfo d, params string[] ignoredExtensions)
             {
                 long size = 0;
                 // Add file sizes.
                 var fis = d.GetFiles();
                 foreach (var fi in fis)
                 {
+                    if (ignoredExtensions != null && ignoredExtensions.Contains(fi.Extension, StringComparer.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
                     size += fi.Length;
                 }
                 // Add subdirectory sizes.
@@ -3530,7 +3565,10 @@ namespace Microsoft.Crank.Agent
                     if (targetFrameworksElements.Any())
                     {
                         var targetFrameworksElement = targetFrameworksElements.First();
-                        ((XElement)targetFrameworksElement).Value = targetFramework;
+                        targetFrameworksElement.Value = targetFramework;
+
+                        // Replace <TargetFrameworks> by <TargetFramework> to circumvent https://github.com/dotnet/sdk/issues/32536
+                        targetFrameworksElement.Name = "TargetFramework";
                     }
                     else
                     {
@@ -3539,7 +3577,7 @@ namespace Microsoft.Crank.Agent
                         if (targetFrameworkElements.Any())
                         {
                             var targetFrameworkElement = targetFrameworkElements.First();
-                            ((XElement)targetFrameworkElement).Value = targetFramework;
+                            targetFrameworkElement.Value = targetFramework;
                         }
                     }
 
@@ -4279,9 +4317,9 @@ namespace Microsoft.Crank.Agent
                 {
                     if (line.StartsWith(prefix))
                     {
-                        var fragments = line.Split(',', 2);
-                        var hash = fragments[0].Split(':', 2)[1].Trim();
-                        var version = fragments[1].Trim();
+                        var fragments = line.Split(_splitChars, StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
+                        var hash = fragments[1];
+                        var version = fragments[3];
 
                         return (version, hash);
                     }
@@ -4377,7 +4415,7 @@ namespace Microsoft.Crank.Agent
             return false;
         }
 
-        private static async Task TryDeleteDirAsync(string path, bool rethrow = true)
+        private static async Task TryDeleteDirAsync(string path)
         {
             if (String.IsNullOrEmpty(path) || !Directory.Exists(path))
             {
@@ -4450,7 +4488,7 @@ namespace Microsoft.Crank.Agent
 
             var iis = job.WebHost == WebHost.IISInProcess || job.WebHost == WebHost.IISOutOfProcess;
 
-            // Running BeforeScript
+            // Run scripts before the benchmark is run
             if (!String.IsNullOrEmpty(job.BeforeScript))
             {
                 var segments = job.BeforeScript.Split(' ', 2);
@@ -4715,25 +4753,7 @@ namespace Microsoft.Crank.Agent
 
                 if (!String.IsNullOrWhiteSpace(job.CpuSet))
                 {
-                    var cpuSet = new List<int>();
-
-                    var ranges = job.CpuSet.Split(',', StringSplitOptions.RemoveEmptyEntries);
-                    foreach (var r in ranges)
-                    {
-                        var bounds = r.Split('-', 2);
-
-                        if (r.Length == 1)
-                        {
-                            cpuSet.Add(int.Parse(bounds[0]));
-                        }
-                        else
-                        {
-                            for (var i = int.Parse(bounds[0]); i<= int.Parse(bounds[1]); i++)
-                            {
-                                cpuSet.Add(i);
-                            }                            
-                        }
-                    }
+                    var cpuSet = CalculateCpuList(job.CpuSet);
 
                     var ssi = Kernel32.GetSystemCpuSetInformation(safeProcess).ToArray();
                     var cpuSets = cpuSet.Select(i => ssi[i].CpuSet.Id).ToArray();
@@ -4778,11 +4798,36 @@ namespace Microsoft.Crank.Agent
                 }
             }
         }
+        
+        public static List<int> CalculateCpuList(string cpuSet)
+        {
+            var result = new List<int>();
+
+            var ranges = cpuSet.Split(',', StringSplitOptions.RemoveEmptyEntries);
+            foreach (var r in ranges)
+            {
+                var bounds = r.Split('-', 2);
+
+                if (bounds.Length == 1)
+                {
+                    result.Add(int.Parse(bounds[0]));
+                }
+                else
+                {
+                    for (var i = int.Parse(bounds[0]); i <= int.Parse(bounds[1]); i++)
+                    {
+                        result.Add(i);
+                    }
+                }
+            }
+
+            return result;
+        }
 
         private static string GetCGroupController(Job job)
         {
             // Create a unique cgroup controller per agent
-            return $"benchmarks-{Process.GetCurrentProcess().Id}-{job.Id}";
+            return $"benchmarks-{Environment.ProcessId}-{job.Id}";
         }
 
         private static async Task StartCountersAsync(Job job, JobContext context)
@@ -4794,24 +4839,52 @@ namespace Microsoft.Crank.Agent
 
             Log.Info("Starting counters");
 
+            var metricsEventSourceSessionId = Guid.NewGuid().ToString();
+
             var client = new DiagnosticsClient(job.ProcessId);
 
             var providerNames = job.Counters.Select(x => x.Provider).Distinct().ToArray();
 
-            var providerList = providerNames
-                .Select(p => new EventPipeProvider(
-                    name: p,
-                    eventLevel: EventLevel.Informational,
-                    arguments: new Dictionary<string, string>() 
-                        { { "EventCounterIntervalSec", job.MeasurementsIntervalSec.ToString(CultureInfo.InvariantCulture) } })
-                )
-                .ToList();
+            // Configured providers
+            var providerList = new List<EventPipeProvider>();
 
+            providerList.AddRange(providerNames.Select(p =>
+                new EventPipeProvider(name: p, eventLevel: EventLevel.Informational,
+                    arguments: new Dictionary<string, string>()
+                    {
+                        { "EventCounterIntervalSec", job.MeasurementsIntervalSec.ToString(CultureInfo.InvariantCulture) }
+                    })
+                )
+            );
+
+            // Custom measurements sent by the benchmark
             providerList.Add(
                 new EventPipeProvider(
                     name: "Benchmarks",
                     eventLevel: EventLevel.Verbose)
             );
+
+            // System.Diagnostics.Metrics EventSource supports the new Meter/Instrument APIs
+
+            const long TimeSeriesValues = 0x2;
+            var metrics = string.Join(",", providerNames);
+
+            var defaultMaxHitograms = 10;
+            var defaultMaxTimeSeries = 1000;
+
+            var metricsEventSourceProvider =
+                new EventPipeProvider("System.Diagnostics.Metrics", EventLevel.Informational, TimeSeriesValues,
+                    new Dictionary<string, string>()
+                    {
+                        { "SessionId", metricsEventSourceSessionId },
+                        { "Metrics", metrics },
+                        { "RefreshInterval", job.MeasurementsIntervalSec.ToString() },
+                        { "MaxTimeSeries", defaultMaxHitograms.ToString() },
+                        { "MaxHistograms", defaultMaxTimeSeries.ToString() }
+                    }
+                );
+
+            providerList.Add(metricsEventSourceProvider);
 
             context.EventPipeSession = null;
 
@@ -4895,7 +4968,7 @@ namespace Microsoft.Crank.Agent
                         {
                             job.Measurements.Enqueue(new Measurement
                             {
-                                Timestamp = eventData.TimeStamp,
+                                Timestamp = eventData.TimeStamp.ToUniversalTime(),
                                 Name = eventData.PayloadByName("name").ToString(),
                                 Value = eventData.PayloadByName("value")
                             });
@@ -4914,9 +4987,58 @@ namespace Microsoft.Crank.Agent
                             });
                         }
                     }
+                    else if (eventData.ProviderName == "System.Diagnostics.Metrics")
+                    {
+                        var sessionId = (string)eventData.PayloadValue(0);
 
-                    // We only track event counters
-                    if (eventData.EventName.Equals("EventCounters"))
+                        var m = new Measurement
+                        {
+                            Timestamp = eventData.TimeStamp.ToUniversalTime()
+                        };
+
+                        // Used when debugging metrics only
+                        // Log.Warning($"sessionId: {sessionId} eventName: {eventData.EventName} meterName: {eventData.PayloadValue(1)} intrumentName: {eventData.PayloadValue(3)}");
+
+                        if (sessionId == metricsEventSourceSessionId)
+                        {
+                            string meterName, instrumentName, valueText;
+
+                            switch (eventData.EventName)
+                            {
+                                case "GaugeValuePublished":
+                                case "CounterRateValuePublished":
+
+                                    meterName = (string)eventData.PayloadValue(1);
+                                    instrumentName = (string)eventData.PayloadValue(3);
+                                    valueText = (string)eventData.PayloadValue(6);
+
+                                    // The value might be an empty string indicating no measurement was provided this collection interval
+                                    if (double.TryParse(valueText, NumberStyles.Number | NumberStyles.Float, CultureInfo.InvariantCulture, out var rate))
+                                    {
+                                        m.Name = instrumentName;
+                                        m.Value = rate;
+                                        job.Measurements.Enqueue(m);
+                                    }
+                                    break;
+
+                                case "HistogramValuePublished":
+                                    meterName = (string)eventData.PayloadValue(1);
+                                    instrumentName = (string)eventData.PayloadValue(3);
+                                    valueText = (string)eventData.PayloadValue(6);
+
+                                    var quantiles = ParseQuantiles(valueText);
+
+                                    foreach ((var key, var val) in quantiles)
+                                    {
+                                        m.Name = $"{instrumentName}-{(int)key * 100}";
+                                        m.Value = val;
+                                        job.Measurements.Enqueue(m);
+                                    }
+                                    break;
+                            }
+                        }
+                    }
+                    else if (eventData.EventName.Equals("EventCounters"))
                     {
                         var payloadVal = (IDictionary<string, object>)(eventData.PayloadValue(0));
                         var payloadFields = (IDictionary<string, object>)(payloadVal["Payload"]);
@@ -4955,7 +5077,7 @@ namespace Microsoft.Crank.Agent
                                 break;
                         }
 
-                        measurement.Timestamp = eventData.TimeStamp;
+                        measurement.Timestamp = eventData.TimeStamp.ToUniversalTime();
 
                         job.Measurements.Enqueue(measurement);
                     }
@@ -5319,7 +5441,7 @@ namespace Microsoft.Crank.Agent
 
             job.Measurements.Enqueue(new Measurement
             {
-                Name = "benchmarks/start-time",
+                Name = Measurements.BenchmarksStartTime,
                 Timestamp = DateTime.UtcNow,
                 Value = stopwatch.ElapsedMilliseconds
             });
@@ -5429,21 +5551,21 @@ namespace Microsoft.Crank.Agent
 
             job.Measurements.Enqueue(new Measurement
             {
-                Name = "benchmarks/cpu/periods/total",
+                Name = Measurements.BenchmarksCpuPeriodsTotal,
                 Timestamp = DateTime.UtcNow,
                 Value = nrPeriods
             });
 
             job.Measurements.Enqueue(new Measurement
             {
-                Name = "benchmarks/cpu/periods/throttled",
+                Name = Measurements.BenchmarksCpuPeriodsThrottled,
                 Timestamp = DateTime.UtcNow,
                 Value = nrThrottled
             });
 
             job.Measurements.Enqueue(new Measurement
             {
-                Name = "benchmarks/cpu/throttled",
+                Name = Measurements.BenchmarksCpuThrottled,
                 Timestamp = DateTime.UtcNow,
                 Value = throttledTime
             });
@@ -5787,7 +5909,6 @@ namespace Microsoft.Crank.Agent
                 }
             }
 
-
             if (!providerCollection.Any())
             {
                 Log.Info($"Tracing arguments not valid: {providers}");
@@ -5856,7 +5977,7 @@ namespace Microsoft.Crank.Agent
                 // From the /tmp folder (in Docker, should be mounted to /mnt/benchmarks) use a specific 'benchmarksserver' root folder to isolate from other services
                 // that use the temp folder, and create a sub-folder (process-id) for each server running.
                 // The cron job is responsible for cleaning the folders
-                _rootTempDir = Path.Combine(_buildPath, $"benchmarks-server-{Process.GetCurrentProcess().Id}");
+                _rootTempDir = Path.Combine(_buildPath, $"benchmarks-server-{Environment.ProcessId}");
 
                 if (Directory.Exists(_rootTempDir))
                 {
@@ -5922,7 +6043,10 @@ namespace Microsoft.Crank.Agent
                 if (!File.Exists(_perfviewPath))
                 {
                     Log.Info($"Downloading PerfView to '{_perfviewPath}'");
-                    await DownloadFileAsync(_perfviewUrl, _perfviewPath, maxRetries: 5, timeout: 60);
+                    if (!await DownloadFileAsync(_perfviewUrl, _perfviewPath, maxRetries: 5, timeout: 60, throwOnError: false))
+                    {
+                        Log.Warning("Failed to download PerfView.exe");
+                    }
                 }
             }
 
@@ -5980,12 +6104,36 @@ namespace Microsoft.Crank.Agent
 
                 if (_cleanup && Directory.Exists(_rootTempDir))
                 {
-                    TryDeleteDirAsync(_rootTempDir, false).GetAwaiter().GetResult();
+                    TryDeleteDirAsync(_rootTempDir).GetAwaiter().GetResult();
                 }
             }
             finally
             {
             }
+        }
+
+        private static KeyValuePair<double, double>[] ParseQuantiles(string quantileList)
+        {
+            var quantileParts = quantileList.Split(';', StringSplitOptions.RemoveEmptyEntries);
+            var quantiles = new List<KeyValuePair<double, double>>();
+            foreach (var quantile in quantileParts)
+            {
+                var keyValParts = quantile.Split('=', StringSplitOptions.RemoveEmptyEntries);
+                if (keyValParts.Length != 2)
+                {
+                    continue;
+                }
+                if (!double.TryParse(keyValParts[0], NumberStyles.Number | NumberStyles.Float, CultureInfo.InvariantCulture, out var key))
+                {
+                    continue;
+                }
+                if (!double.TryParse(keyValParts[1], NumberStyles.Number | NumberStyles.Float, CultureInfo.InvariantCulture, out var val))
+                {
+                    continue;
+                }
+                quantiles.Add(new KeyValuePair<double, double>(key, val));
+            }
+            return quantiles.ToArray();
         }
     }
 }

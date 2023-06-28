@@ -17,8 +17,6 @@ using System.Threading.Tasks;
 using Fluid;
 using Fluid.Values;
 using Jint;
-using Manatee.Json;
-using Manatee.Json.Schema;
 using McMaster.Extensions.CommandLineUtils;
 using Microsoft.Azure.Relay;
 using Microsoft.Crank.Controller.Serializers;
@@ -40,13 +38,14 @@ namespace Microsoft.Crank.Controller
         private static string _sqlConnectionString = "";
         private static string _indexName = "benchmarks";
         private static string _elasticSearchUrl = "";
-        private const string DefaultBenchmarkDotNetArguments = "--inProcess --cli {{benchmarks-cli}} --join --exporters briefjson markdown";
+        private const string DefaultBenchmarkDotNetArguments = "--inProcess --cli \"{{benchmarks-cli}}\" --join --exporters briefjson markdown";
 
         // Default to arguments which should be sufficient for collecting trace of default Plaintext run
         // c.f. https://github.com/Microsoft/perfview/blob/main/src/PerfView/CommandLineArgs.cs
         private const string _defaultTraceArguments = "BufferSizeMB=1024;CircularMB=4096;TplEvents=None;Providers=Microsoft-Diagnostics-DiagnosticSource:0:0;KernelEvents=default+ThreadTime-NetworkTCPIP";
 
-        private static readonly ScriptConsole _scriptConsole = new ScriptConsole();
+        private static readonly ScriptConsole _scriptConsole = new();
+        private static readonly ScriptFile _scriptFile = new();
 
         private static CommandOption
             _configOption,
@@ -148,7 +147,7 @@ namespace Microsoft.Crank.Controller
                 OptionsComparison = StringComparison.OrdinalIgnoreCase,
             };
 
-            app.HelpOption("-?|-h|--help");
+            app.HelpOption("-?|-h|--help", true);
 
             _configOption = app.Option("-c|--config", "Configuration file or url.", CommandOptionType.MultipleValue);
             _scenarioOption = app.Option("-s|--scenario", "Scenario to execute.", CommandOptionType.SingleValue);
@@ -470,6 +469,13 @@ namespace Microsoft.Crank.Controller
                 {
                     Console.Error.WriteLine("The arguments --scenario and --job can't be used together. They both define which jobs to run.");
                     return 1;
+                }
+
+                if (!_profileOption.HasValue())
+                {
+                    Console.ForegroundColor = ConsoleColor.DarkYellow;
+                    Console.WriteLine("The argument --profile was not specified which is uncommon. You migh need to add one if your benchmark doesn't work.");
+                    Console.ResetColor();
                 }
 
                 var results = new ExecutionResult();
@@ -1165,6 +1171,11 @@ namespace Microsoft.Crank.Controller
                                 {
                                     yield return job.Key + "." + e.Key;
                                 }
+
+                                foreach (var e in job.Value.Variables)
+                                {
+                                    yield return job.Key + "." + e.Key;
+                                }
                             }
 
                             foreach (var p in result.JobResults.Properties)
@@ -1190,6 +1201,11 @@ namespace Microsoft.Crank.Controller
                                 }
 
                                 foreach (var e in job.Value.Environment)
+                                {
+                                    yield return Convert.ToString(e.Value, System.Globalization.CultureInfo.InvariantCulture);
+                                }
+
+                                foreach (var e in job.Value.Variables)
                                 {
                                     yield return Convert.ToString(e.Value, System.Globalization.CultureInfo.InvariantCulture);
                                 }
@@ -1263,7 +1279,7 @@ namespace Microsoft.Crank.Controller
 
             bool SpanShouldKeepJobRunning(string jobName)
             {
-                if (IsRepeatOver() || IsRepeatOver())
+                if (IsRepeatOver())
                 {
                     return false;
                 }
@@ -1654,6 +1670,8 @@ namespace Microsoft.Crank.Controller
         {
             JObject configuration = null;
 
+            profileNames ??= Array.Empty<string>();
+
             var defaultConfigFilename = Path.Combine(Path.GetDirectoryName(typeof(Program).Assembly.Location), "default.config.yml");
 
             configurationFileOrUrls = new[] { defaultConfigFilename }.Union(configurationFileOrUrls);
@@ -1753,6 +1771,11 @@ namespace Microsoft.Crank.Controller
 
             foreach (var profileName in profileNames)
             {
+                if (String.IsNullOrEmpty(profileName))
+                {
+                    continue;
+                }
+
                 // Check the requested profile name exists
                 if (!configurationInstance.Profiles.ContainsKey(profileName))
                 {
@@ -1918,6 +1941,7 @@ namespace Microsoft.Crank.Controller
             var engine = new Engine();
 
             engine.SetValue("console", _scriptConsole);
+            engine.SetValue("fs", _scriptFile);
             engine.SetValue("configuration", result);
 
             foreach (var jobName in dependencies)
@@ -2127,10 +2151,10 @@ namespace Microsoft.Crank.Controller
                         localconfiguration = JObject.Parse(json);
 
                         var schemaJson = File.ReadAllText(Path.Combine(Path.GetDirectoryName(typeof(Program).Assembly.Location), "benchmarks.schema.json"));
-                        var schema = new Manatee.Json.Serialization.JsonSerializer().Deserialize<JsonSchema>(JsonValue.Parse(schemaJson));
+                        var schema = Json.Schema.JsonSchema.FromText(schemaJson);
 
-                        var jsonToValidate = JsonValue.Parse(json);
-                        var validationResults = schema.Validate(jsonToValidate, new JsonSchemaOptions { OutputFormat = SchemaValidationOutputFormat.Detailed });
+                        var jsonToValidate = System.Text.Json.Nodes.JsonNode.Parse(json);
+                        var validationResults = schema.Validate(jsonToValidate, new Json.Schema.ValidationOptions { OutputFormat = Json.Schema.OutputFormat.Detailed });
 
                         if (!validationResults.IsValid)
                         {
@@ -2143,7 +2167,7 @@ namespace Microsoft.Crank.Controller
                             var errorBuilder = new StringBuilder();
 
                             errorBuilder.AppendLine($"Invalid configuration file '{configurationFilenameOrUrl}' at '{validationResults.InstanceLocation}'");
-                            errorBuilder.AppendLine($"{validationResults.ErrorMessage}");
+                            errorBuilder.AppendLine($"{validationResults.Message}");
                             errorBuilder.AppendLine($"Debug file created at '{debugFilename}'");
 
                             throw new ControllerException(errorBuilder.ToString());
@@ -2351,14 +2375,15 @@ namespace Microsoft.Crank.Controller
 
             engine.SetValue("benchmarks", jobResults);
             engine.SetValue("console", _scriptConsole);
+            engine.SetValue("fs", _scriptFile);
             engine.SetValue("require", new Action<string>(ImportScript));
 
             void ImportScript(string s)
             {
                 if (!configuration.Scripts.ContainsKey(s))
                 {
-                    var availablescripts = String.Join("', '", configuration.Scripts.Keys);
-                    throw new ControllerException($"Could not find a script named '{s}'. Possible values: '{availablescripts}'");
+                    var availableScripts = String.Join("', '", configuration.Scripts.Keys);
+                    throw new ControllerException($"Could not find a script named '{s}'. Possible values: '{availableScripts}'");
                 }
 
                 engine.Execute(configuration.Scripts[s]);
@@ -2484,6 +2509,15 @@ namespace Microsoft.Crank.Controller
                     .ToArray();
 
                 jobResult.Results = AggregateAndReduceResults(jobConnections, engine, resultDefinitions.Values.ToList());
+
+                configuration.Jobs.TryGetValue(jobName, out var job);
+                if (job != null)
+                {
+                    foreach (var variable in job.Variables)
+                    {
+                        jobResult.Variables.Add(variable.Key, variable.Value);
+                    }
+                }
 
                 foreach (var jobConnection in jobConnections)
                 {

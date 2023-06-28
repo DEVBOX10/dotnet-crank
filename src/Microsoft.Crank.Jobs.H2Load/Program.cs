@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Net.Http;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using McMaster.Extensions.CommandLineUtils;
@@ -40,6 +41,7 @@ namespace H2LoadClient
             var optionDuration = app.Option<int>("-d|--duration <N>", "Duration of the test in seconds", CommandOptionType.SingleValue);
             var optionProtocol = app.Option<string>("-p|--protocol <S>", "The HTTP protocol to use", CommandOptionType.SingleValue);
             var optionBody = app.Option<string>("-b|--body <S>", "Request body as base64 encoded text", CommandOptionType.SingleValue);
+            var optionBodyFile = app.Option<string>("--bodyFile <S>", "Url for a file to use as the body content", CommandOptionType.SingleValue);
             var optionHeaders = app.Option<string>("--header <S>", "Add a header to the request", CommandOptionType.MultipleValue);
 
             app.OnExecuteAsync(async cancellationToken =>
@@ -57,14 +59,15 @@ namespace H2LoadClient
                 Protocol = optionProtocol.Value();
 
                 Headers = new Dictionary<string, string>();
+
                 foreach (var header in optionHeaders.ParsedValues)
                 {
-                    var headerParts = header.Split('=');
+                    var headerParts = header.Split(':', 2, StringSplitOptions.TrimEntries);
                     var key = headerParts[0];
                     var value = headerParts[1];
                     Headers.Add(key, value);
 
-                    Console.WriteLine($"Header: {key}={value}");
+                    Console.WriteLine($"Header: '{key}: {value}'");
                 }
 
                 if (Headers.Count == 0)
@@ -72,9 +75,19 @@ namespace H2LoadClient
                     Console.WriteLine("No headers");
                 }
 
-                if (optionBody.HasValue())
+                if (optionBody.HasValue() || optionBodyFile.HasValue())
                 {
-                    var requestBody = Convert.FromBase64String(optionBody.Value());
+                    byte[] requestBody;
+
+                    if (optionBody.HasValue())
+                    {
+                        requestBody = Convert.FromBase64String(optionBody.Value());
+                    }
+                    else
+                    {
+                        using var client = new HttpClient();
+                        requestBody = await client.GetByteArrayAsync(optionBodyFile.Value());
+                    }
 
                     // h2load takes a file as the request body
                     // write the body to a temporary file that is deleted in stop job
@@ -84,16 +97,53 @@ namespace H2LoadClient
                     Console.WriteLine($"Request body of {requestBody.Length} written to '{RequestBodyFile}'.");
                 }
 
-                var process = StartProcess();
+                // Measure first request
 
-                Console.WriteLine("Waiting for process exit");
-                process.WaitForExit();
+                var tmpValues = new { Requests, Connections, Duration, Warmup, Threads };
+                Requests = 1;
+                Duration = 0;
+                Warmup = 0;
+                Connections = 1;
+                Threads = 1;
+                Output = "";
 
-                // Wait for all Output messages to be flushed and available in Output
-                await Task.Delay(100);
+                using (var process = StartProcess())
+                {
+                    Console.WriteLine("Waiting for process exit");
+                    process.WaitForExit();
 
-                Console.WriteLine("Parsing output");
-                ParseOutput();
+                    // Wait for all Output messages to be flushed and available in Output
+                    await Task.Delay(100);
+
+                    Console.WriteLine("Reading first request");
+                    var p100Match = Regex.Match(Output, @"time for request: \s+[\d\.]+\w+\s+([\d\.]+)(\w+)");
+                    var maxLatency = ReadLatency(p100Match);
+
+                    BenchmarksEventSource.Register("http/firstrequest", Operations.Max, Operations.Max, "First Request (ms)", "Time to first request in ms", "n0");
+                    BenchmarksEventSource.Measure("http/firstrequest", maxLatency);
+                }
+
+                // Actual load
+
+                Requests = tmpValues.Requests;
+                Connections = tmpValues.Connections;
+                Duration = tmpValues.Duration;
+                Warmup = tmpValues.Warmup;
+                Threads = tmpValues.Threads;
+                Output = "";
+                
+                using (var process = StartProcess())
+                {
+
+                    Console.WriteLine("Waiting for process exit");
+                    process.WaitForExit();
+
+                    // Wait for all Output messages to be flushed and available in Output
+                    await Task.Delay(100);
+
+                    Console.WriteLine("Parsing output");
+                    ParseOutput();
+                }
             });
 
             await app.ExecuteAsync(args);
@@ -108,7 +158,7 @@ namespace H2LoadClient
             BenchmarksEventSource.Register("h2load/latency/mean;http/latency/mean", Operations.Max, Operations.Sum, "Mean latency (ms)", "Mean latency (ms)", "n2");
             BenchmarksEventSource.Register("h2load/latency/max;http/latency/max", Operations.Max, Operations.Sum, "Max latency (ms)", "Max latency (ms)", "n2");
 
-            BenchmarksEventSource.Register("h2load/rps/max;http/rps/max", Operations.Max, Operations.Sum, "Max RPS", "RPS: max", "n0");
+            BenchmarksEventSource.Register("h2load/rps/mean;http/rps/mean", Operations.Max, Operations.Sum, "Requests/sec", "Requests per second", "n0");
             BenchmarksEventSource.Register("h2load/raw", Operations.All, Operations.All, "Raw results", "Raw results", "object");
 
             double rps = 0;
@@ -140,7 +190,7 @@ namespace H2LoadClient
             BenchmarksEventSource.Measure("h2load/latency/mean;http/latency/mean", averageLatency);
             BenchmarksEventSource.Measure("h2load/latency/max;http/latency/max", maxLatency);
 
-            BenchmarksEventSource.Measure("h2load/rps/max;http/rps/max", rps);
+            BenchmarksEventSource.Measure("h2load/rps/mean;http/rps/mean", rps);
 
             BenchmarksEventSource.Measure("h2load/raw", Output);
         }
@@ -260,8 +310,24 @@ namespace H2LoadClient
                 command += $" -H \"{header.Key}: {header.Value}\"";
             }
 
-            command += $" -c {Connections} -T {Timeout} -t {Threads} -m {Streams} --warm-up-time {Warmup}";
-            command += Requests > 0 ? $" -n {Requests}" : $" -D {Duration}";
+            command += $" -c {Connections} -T {Timeout} -t {Threads} -m {Streams}";
+
+            if (Warmup > 0)
+            {
+                command += $" --warm-up-time {Warmup}";
+            }
+
+            if (Requests > 0)
+            {
+                command += $" -n {Requests}";
+            }
+
+            if (Duration > 0)
+            {
+                command += $" -D {Duration}";
+            }
+
+            
 
             switch (Protocol)
             {

@@ -49,10 +49,10 @@ stages:
         pool:
           ${{ if eq(variables['System.TeamProject'], 'public') }}:
             name: NetCore-Public
-            demands: ImageOverride -equals Build.Server.Amd64.VS2019.Open
+            demands: ImageOverride -equals windows.vs2022.amd64.open
           ${{ if eq(variables['System.TeamProject'], 'internal') }}:
             name: NetCore1ESPool-Internal
-            demands: ImageOverride -equals Build.Server.Amd64.VS2019
+            demands: ImageOverride -equals windows.vs2022.amd64
         variables:
           
 
@@ -164,6 +164,7 @@ stages:
       # Symbol validation isn't being very reliable lately. This should be enabled back
       # once this issue is resolved: https://github.com/dotnet/arcade/issues/2871
       enableSymbolValidation: false
+      enableSigningValidation: true
       # It's a private repo in github so this won't pass until we create an internal mirror
       enableSourceLinkValidation: false
       publishingInfraVersion: 3

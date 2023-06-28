@@ -15,10 +15,9 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 using Fluid;
-using Manatee.Json;
-using Manatee.Json.Schema;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Octokit;
@@ -42,6 +41,7 @@ namespace Microsoft.Crank.PullRequestBot
         private const string BenchmarkCommand = "/benchmark";
         private const string BaseFilename = "base.json";
         private const string PrFilename = "pr.json";
+        private const int CrankMaxRetries = 2; // retry once after an unsuccessful run
 
         private static DateTime CommentCutoffDate;
 
@@ -116,6 +116,9 @@ namespace Microsoft.Crank.PullRequestBot
                 new Option<int>(
                     "--age",
                     "The age of the most recent comment to look for in minutes. Default is 60."),
+                new Option<Uri>(
+                    "--external-log-uri",
+                    "Link to the logs (e.g. in AzDO) to publish in the start comment."),
             };
 
             rootCommand.Description = "Crank Pull Requests Bot";
@@ -166,6 +169,9 @@ namespace Microsoft.Crank.PullRequestBot
             // Load configuration files
 
             _configuration = await LoadConfigurationAsync(_options.Config);
+
+            // Compute a thumbprint for this run before anything uses it
+            CreateThumbprint();
 
             string host = "github.com", owner = null, name = null;
 
@@ -247,26 +253,31 @@ namespace Microsoft.Crank.PullRequestBot
                     return 0;
                 }
 
-                CreateThumbprint();
-
                 var command = new Command { PullRequest = pr, Benchmarks = benchmarkNames, Profiles = profileNames, Components = componentNames };
 
-                var results = await RunBenchmark(command, options.AccessToken);
-
-                if (options.PublishResults)
+                try
                 {
-                    var text = new StringBuilder();
+                    var results = await RunBenchmark(command, options.AccessToken);
 
-                    foreach (var result in results)
+                    if (options.PublishResults)
                     {
-                        text.AppendLine(FormatResult(result));
+                        var text = new StringBuilder();
+
+                        foreach (var result in results)
+                        {
+                            text.AppendLine(FormatResult(result));
+                        }
+
+                        await UpgradeAuthenticatedClient();
+
+                        var issueComment = await _githubClient.Issue.Comment.Create(owner, name, command.PullRequest.Number, ApplyThumbprint(text.ToString()));
+
+                        Console.WriteLine($"Results published at {issueComment.HtmlUrl}");
                     }
-
-                    await UpgradeAuthenticatedClient();
-
-                    var issueComment = await _githubClient.Issue.Comment.Create(owner, name, command.PullRequest.Number, ApplyThumbprint(text.ToString()));
-
-                    Console.WriteLine($"Results published at {issueComment.HtmlUrl}");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Failed to benchmark PR #{command.PullRequest.Number}. Skipping... Details:\n```\n{ex}\n```");
                 }
             }
             else
@@ -286,22 +297,58 @@ namespace Microsoft.Crank.PullRequestBot
 
                     var pr = command.PullRequest;
 
+                    Console.WriteLine($"Scanning for benchmark requests in {owner}/{name}.");
+
                     try
                     {
-                        await _githubClient.Issue.Comment.Create(owner, name, command.PullRequest.Number, ApplyThumbprint($"Benchmark started for __{string.Join(", ", command.Benchmarks)}__ on __{string.Join(", ", command.Profiles)}__ with __{string.Join(", ", command.Components)}__"));
+                        var startComment = $"Benchmark started for __{string.Join(", ", command.Benchmarks)}__ on __{string.Join(", ", command.Profiles)}__ with __{string.Join(", ", command.Components)}__";
+                        if (command.Arguments != null)
+                        {
+                            startComment += $" and arguments `{command.Arguments}`";
+                        }
+                        if (_options.ExternalLogUri != null)
+                        {
+                            startComment += $". Logs: [link]({_options.ExternalLogUri.OriginalString})";
+                        }
+                        
+                        await _githubClient.Issue.Comment.Create(owner, name, command.PullRequest.Number, ApplyThumbprint(startComment));
 
                         var results = await RunBenchmark(command, options.AccessToken);
 
                         if (options.PublishResults)
                         {
-                            var text = new StringBuilder();
+                            Console.WriteLine("Publishing results");
 
-                            foreach (var result in results)
+                            try
                             {
-                                text.AppendLine(FormatResult(result));
-                            }
+                                var text = new StringBuilder();
 
-                            await _githubClient.Issue.Comment.Create(owner, name, command.PullRequest.Number, ApplyThumbprint(text.ToString()));
+                                foreach (var result in results)
+                                {
+                                    text.AppendLine(FormatResult(result));
+                                }
+
+                                Console.WriteLine($"Creating result:\n{text}");
+
+                                var newComment = await _githubClient.Issue.Comment.Create(owner, name, command.PullRequest.Number, ApplyThumbprint(text.ToString()));
+
+                                if (newComment != null)
+                                {
+                                    Console.WriteLine($"Result published for {owner}/{name}/{command.PullRequest.Number}");
+                                }
+                                else
+                                {
+                                    Console.WriteLine($"Error while publishing a result {owner}/{name}/{command.PullRequest.Number}");
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine($"An error occured: {ex}");
+                            }
+                        }
+                        else
+                        {
+                            Console.WriteLine("Skipping publishing results.");
                         }
                     }
                     catch (Exception ex)
@@ -460,7 +507,7 @@ namespace Microsoft.Crank.PullRequestBot
             string help =
                 "Crank Pull Request Bot\n" +
                 "\n" +
-                "`/benchmark <benchmarks[,...]> <profiles[,...]> <components,[...]>`\n"
+                "`/benchmark <benchmark[,...]> <profile[,...]> <component,[...]> <arguments>`\n"
                 ;
 
             help += $"\nBenchmarks: \n";
@@ -480,6 +527,7 @@ namespace Microsoft.Crank.PullRequestBot
             {
                 help += $"- `{entry.Key}`\n";
             }
+            help += $"\nArguments: any additional arguments to pass through to crank, e.g. `--variable name=value`\n";
 
             if (!markdown)
             {
@@ -570,10 +618,10 @@ namespace Microsoft.Crank.PullRequestBot
                         localconfiguration = JObject.Parse(json);
 
                         var schemaJson = File.ReadAllText(Path.Combine(Path.GetDirectoryName(typeof(Program).Assembly.Location), "pullrequestbot.schema.json"));
-                        var schema = new Manatee.Json.Serialization.JsonSerializer().Deserialize<JsonSchema>(JsonValue.Parse(schemaJson));
+                        var schema = Json.Schema.JsonSchema.FromText(schemaJson);
 
-                        var jsonToValidate = JsonValue.Parse(json);
-                        var validationResults = schema.Validate(jsonToValidate, new JsonSchemaOptions { OutputFormat = SchemaValidationOutputFormat.Detailed });
+                        var jsonToValidate = System.Text.Json.Nodes.JsonNode.Parse(json);
+                        var validationResults = schema.Validate(jsonToValidate, new Json.Schema.ValidationOptions { OutputFormat = Json.Schema.OutputFormat.Detailed });
 
                         if (!validationResults.IsValid)
                         {
@@ -586,7 +634,7 @@ namespace Microsoft.Crank.PullRequestBot
                             var errorBuilder = new StringBuilder();
 
                             errorBuilder.AppendLine($"Invalid configuration file '{configurationFilenameOrUrl}' at '{validationResults.InstanceLocation}'");
-                            errorBuilder.AppendLine($"{validationResults.ErrorMessage}");
+                            errorBuilder.AppendLine($"{validationResults.Message}");
                             errorBuilder.AppendLine($"Debug file created at '{debugFilename}'");
 
                             throw new PullRequestBotException(errorBuilder.ToString());
@@ -707,15 +755,53 @@ namespace Microsoft.Crank.PullRequestBot
 
             try
             {
-                await ProcessUtil.RunAsync("git", $"clone --recursive {cloneUrl} {cloneFolder} -b {baseBranch}", workingDirectory: workspace, log: true);
-
-                // Build base
-                foreach (var c in buildCommands)
+                using var buildBaseCts = new CancellationTokenSource();
+                var buildBaseTask = Task.Run(async () =>
                 {
-                    var scriptArgs = Environment.OSVersion.Platform == PlatformID.Win32NT ? $"/c {c}" : $"-c \"{c}\"";
-                    await ProcessUtil.RunAsync(ProcessUtil.GetScriptHost(), scriptArgs, workingDirectory: cloneFolder, log: true);
+                    await ProcessUtil.RunAsync("git", $"clone -c core.longpaths=true --recursive {cloneUrl} {cloneFolder} -b {baseBranch}", workingDirectory: workspace, log: true, cancellationToken: buildBaseCts.Token);
+
+                    // Build base
+                    foreach (var c in buildCommands)
+                    {
+                        buildBaseCts.Token.ThrowIfCancellationRequested();
+
+                        var scriptArgs = Environment.OSVersion.Platform == PlatformID.Win32NT ? $"/c {c}" : $"-c \"{c}\"";
+                        await ProcessUtil.RunAsync(ProcessUtil.GetScriptHost(), scriptArgs, workingDirectory: cloneFolder, log: true, cancellationToken: buildBaseCts.Token);
+                    }
+                });
+
+                var runOptions = new RunOptions(CrankMaxRetries, captureOutput: false); // note: runOptions.Variables are modified
+
+                // In parallel with build, pre-check crank commands -- run without copying private bits from components
+                // to verify that commands are correct and agents are up
+                try
+                {
+                    Console.WriteLine($"Pre-check started...");
+                    foreach (var run in runs)
+                    {
+                        var benchmark = _configuration.Benchmarks[run.Benchmark];
+                        var profile = _configuration.Profiles[run.Profile];
+
+                        runOptions.Variables = benchmark.Variables;
+                        RunCrank(runOptions, _configuration.Defaults, benchmark.Arguments, profile.Arguments, command.Arguments, _options.Arguments);
+                    }
+                }
+                catch (Exception)
+                {
+                    Console.WriteLine($"Pre-check failed");
+                    buildBaseCts.Cancel(); // Cancel build on pre-check failure
+                    try
+                    {
+                        await buildBaseTask; // Wait for ProcessUtil to kill the process, swallow exception
+                    } catch { }
+
+                    throw; // Re-throw original pre-check exception
                 }
 
+                Console.WriteLine($"Pre-check successful");
+                await buildBaseTask; // on successful pre-check, wait until build is finished
+
+                Console.WriteLine($"Base run started...");
                 foreach (var run in runs)
                 {
                     var benchmark = _configuration.Benchmarks[run.Benchmark];
@@ -730,7 +816,8 @@ namespace Microsoft.Crank.PullRequestBot
                     File.Delete(prResultsFilename);
 
                     Directory.SetCurrentDirectory(cloneFolder);
-                    RunCrank(benchmark.Variables, _configuration.Defaults, benchmark.Arguments, profile.Arguments, buildArguments, $@"--json ""{baseResultsFilename}""", command.Arguments, _options.Arguments);
+                    runOptions.Variables = benchmark.Variables;
+                    RunCrank(runOptions, _configuration.Defaults, benchmark.Arguments, profile.Arguments, buildArguments, $@"--json ""{baseResultsFilename}""", command.Arguments, _options.Arguments);
                 }
 
                 await ProcessUtil.RunAsync("git", $@"fetch origin pull/{prNumber}/head", workingDirectory: cloneFolder, log: true);
@@ -745,6 +832,7 @@ namespace Microsoft.Crank.PullRequestBot
                     await ProcessUtil.RunAsync(ProcessUtil.GetScriptHost(), scriptArgs, workingDirectory: cloneFolder, log: true);
                 }
 
+                Console.WriteLine($"PR run started...");
                 foreach (var run in runs)
                 {
                     var benchmark = _configuration.Benchmarks[run.Benchmark];
@@ -755,13 +843,16 @@ namespace Microsoft.Crank.PullRequestBot
                     var prResultsFilename = $"{workspace}{run.Benchmark}.{PrFilename}";
 
                     Directory.SetCurrentDirectory(cloneFolder);
-                    RunCrank(benchmark.Variables, _configuration.Defaults, benchmark.Arguments, profile.Arguments, buildArguments, $@"--json ""{prResultsFilename}""", command.Arguments, _options.Arguments);
+                    runOptions.Variables = benchmark.Variables;
+                    RunCrank(runOptions, _configuration.Defaults, benchmark.Arguments, profile.Arguments, buildArguments, $@"--json ""{prResultsFilename}""", command.Arguments, _options.Arguments);
 
                     // Compare benchmarks
-                    var result = RunCrank($"compare", $"{baseResultsFilename}", $"{prResultsFilename}");
+                    var result = RunCrank($"compare", baseResultsFilename, prResultsFilename);
 
                     results.Add(new Result(run.Profile, run.Benchmark, result));
                 }
+
+                return results;
             }
             finally
             {
@@ -791,38 +882,74 @@ namespace Microsoft.Crank.PullRequestBot
                     Console.WriteLine($"Failed to clean {cloneFolder}. Ignoring...");
                 }
             }
-
-            return results;
-        }
-
-        private static string RunCrank(IDictionary<string, object> variables, params string[] args)
-        {
-            var templateContext = new TemplateContext(variables);
-            args = args.Select(arg => ApplyTemplate(arg, templateContext)).ToArray();
-
-            return RunCrank(args);
         }
 
         private static string RunCrank(params string[] args)
         {
-            args = args.SelectMany(c => CommandLineStringSplitter.Instance.Split(c)).ToArray();
+            return RunCrank(RunOptions.Default, args);
+        }
+
+        private static string RunCrank(RunOptions options, params string[] args)
+        {
+            IEnumerable<string> rawArgs = args;
+            if (options.Variables != null)
+            {
+                var templateContext = new TemplateContext(options.Variables);
+                rawArgs = rawArgs.Select(arg => ApplyTemplate(arg, templateContext));
+            }
+
+            args = rawArgs.SelectMany(c => CommandLineStringSplitter.Instance.Split(c)).ToArray();
 
             Console.WriteLine($"crank {string.Join(' ', args)}");
 
-            using var sw = new StringWriter();
-            var consoleOut = Console.Out;
-            try
+            for (int i = 0; i < options.MaxRetries; ++i)
             {
-                Console.SetOut(sw);
-                Crank.Controller.Program.Main(args);
+                int exitCode = 1;
+                string result = null;
+
+                try
+                {
+                    if (!options.CaptureOutput)
+                    {
+                        exitCode = Crank.Controller.Program.Main(args);
+                    }
+                    else
+                    {
+                        using var sw = new StringWriter();
+                        var consoleOut = Console.Out;
+                        try
+                        {
+                            Console.SetOut(sw);
+                            exitCode = Crank.Controller.Program.Main(args);
+                        }
+                        finally
+                        {
+                            Console.SetOut(consoleOut);
+                            Console.WriteLine(sw.ToString());
+                        }
+                        result = sw.ToString();
+                    }
+                }
+                catch (Exception e)
+                {
+                    Console.WriteLine(e);
+                }
+
+                if (exitCode == 0)
+                {
+                    // successful run
+                    return result;
+                }
+
+                var errorMessage = "An error occurred during crank run";
+                if (i + 1 < options.MaxRetries)
+                {                
+                    errorMessage += $". Retrying... ({i + 2} of {options.MaxRetries})";
+                }
+                Console.WriteLine(errorMessage);
             }
-            finally
-            {
-                Console.SetOut(consoleOut);
-                Console.WriteLine(sw.ToString());
-            }
-            
-            return sw.ToString();
+
+            throw new InvalidOperationException("Crank run failed. Max retries reached");
         }
     }
 
@@ -850,5 +977,21 @@ namespace Microsoft.Crank.PullRequestBot
         public string Profile { get; set; }
         public string Benchmark { get; set; }
         public string Output { get; set; }
+    }
+
+    public class RunOptions
+    {
+        public static RunOptions Default = new();
+
+        public RunOptions(int maxRetries = 1, bool captureOutput = true, IDictionary<string, object> variables = null)
+        {
+            MaxRetries = maxRetries;
+            CaptureOutput = captureOutput;
+            Variables = variables;
+        }
+
+        public int MaxRetries { get; set; }
+        public bool CaptureOutput { get; set; }
+        public IDictionary<string, object> Variables { get; set; }
     }
 }

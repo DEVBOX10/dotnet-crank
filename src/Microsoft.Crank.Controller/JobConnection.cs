@@ -10,14 +10,13 @@ using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Web;
-using Microsoft.Crank.Models;
 using Microsoft.Crank.Controller.Ignore;
+using Microsoft.Crank.Models;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
-using System.Threading;
-using System.Net.Http.Headers;
 
 namespace Microsoft.Crank.Controller
 {
@@ -35,6 +34,9 @@ namespace Microsoft.Crank.Controller
 
         private string _serverJobUri;
         private bool _keepAlive;
+        private int _keepAliveTimeoutMilliseconds = 5000;
+        private int _keepAlivePeriodMilliseconds = 2000;
+        private int _uploadBufferSize = 1024 * 1024; // default is 80K which is too small on slow network connections
         private DateTime? _runningUtc;
         private string _jobName;
         private bool _traceCollected;
@@ -170,17 +172,9 @@ namespace Microsoft.Crank.Controller
 
                         var sourceDir = Job.Source.LocalFolder;
 
-                        if (!File.Exists(Path.Combine(sourceDir, ".gitignore")))
-                        {
-                            ZipFile.CreateFromDirectory(sourceDir, tempFilename);
-                        }
-                        else
-                        {
-                            Log.Verbose(".gitignore file found");
-                            DoCreateFromDirectory(sourceDir, tempFilename);
-                        }
+                        DoCreateFromDirectory(sourceDir, tempFilename);
 
-                        var result = await UploadFileAsync(tempFilename, Combine(_serverJobUri, "/source"));
+                        var result = await UploadFileAsync(tempFilename, Combine(_serverJobUri, "/source"), gzipped: false);
 
                         File.Delete(tempFilename);
 
@@ -268,26 +262,7 @@ namespace Microsoft.Crank.Controller
                     {
                         foreach (var buildFileValue in Job.Options.BuildFiles)
                         {
-                            var buildFileSegments = buildFileValue.Split(';', 2, StringSplitOptions.RemoveEmptyEntries);
-
-                            var shouldSearchRecursively = buildFileSegments[0].Contains("**");
-                            buildFileSegments[0] = buildFileSegments[0].Replace("**\\", "").Replace("**/", "");
-
-                            foreach (var resolvedFile in Directory.GetFiles(Path.GetDirectoryName(buildFileSegments[0]), Path.GetFileName(buildFileSegments[0]), shouldSearchRecursively ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly))
-                            {                                var resolvedFileWithDestination = resolvedFile;
-
-                                if (buildFileSegments.Length > 1)
-                                {
-                                    resolvedFileWithDestination += ";" + buildFileSegments[1] + Path.GetDirectoryName(resolvedFile).Substring(Path.GetDirectoryName(buildFileSegments[0]).Length) + "/" + Path.GetFileName(resolvedFileWithDestination);
-                                }
-
-                                var result = await UploadFileAsync(resolvedFileWithDestination, _serverJobUri + "/build");
-
-                                if (result != 0)
-                                {
-                                    throw new Exception("Error while uploading build files");
-                                }
-                            }
+                            await HandleBuildFileAsync(buildFileValue);
                         }
                     }
 
@@ -309,28 +284,41 @@ namespace Microsoft.Crank.Controller
                                 outputFileSegments[0] = Path.Combine(".", outputFileSegments[0]);
                             }
 
-                            foreach (var resolvedFile in Directory.GetFiles(Path.GetDirectoryName(outputFileSegments[0]), Path.GetFileName(outputFileSegments[0]), shouldSearchRecursively ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly))
+                            var tempFilename = Path.GetFullPath(Path.GetRandomFileName(), Path.GetTempPath()) + ".zip";
+
+                            using (var archive = ZipFile.Open(tempFilename, ZipArchiveMode.Create))
                             {
-                                var resolvedFileWithDestination = resolvedFile;
-
-                                if (outputFileSegments.Length > 1)
+                                foreach (var resolvedFile in Directory.GetFiles(Path.GetDirectoryName(outputFileSegments[0]), Path.GetFileName(outputFileSegments[0]), shouldSearchRecursively ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly))
                                 {
-                                    resolvedFileWithDestination += ";" + outputFileSegments[1] + Path.GetDirectoryName(resolvedFile).Substring(Path.GetDirectoryName(outputFileSegments[0]).Length) + "/" + Path.GetFileName(resolvedFileWithDestination);
-                                }
+                                    var resolvedFileWithDestination = resolvedFile;
 
-                                var result = await UploadFileAsync(resolvedFileWithDestination, Combine(_serverJobUri, "/attachment"));
+                                    var localPath = resolvedFile.Substring(Path.GetDirectoryName(outputFileSegments[0]).Length).TrimStart('/', '\\');
 
-                                if (result != 0)
-                                {
-                                    throw new Exception("Error while uploading output files");
+                                    if (outputFileSegments.Length > 1)
+                                    {
+                                        localPath = outputFileSegments[1] + Path.GetDirectoryName(resolvedFile).Substring(Path.GetDirectoryName(outputFileSegments[0]).Length) + "/" + Path.GetFileName(resolvedFileWithDestination);
+                                    }
+
+                                    archive.CreateEntryFromFile(resolvedFile, localPath);
+
+                                    Log.Write($"File added: {resolvedFile}");
+
+                                    someFilesWereUploaded = true;
                                 }
-                                
-                                someFilesWereUploaded = true;
                             }
 
                             if (!someFilesWereUploaded)
                             {
                                 Log.WriteWarning($"The argument '{outputFileSegments[0]}' didn't match any existing file.");
+                            }
+                            else
+                            {
+                                var result = await UploadFileAsync(tempFilename, Combine(_serverJobUri, "/attachment/zip"), gzipped: false);
+
+                                if (result != 0)
+                                {
+                                    throw new Exception("Error while uploading output files");
+                                }
                             }
                         }
                     }
@@ -406,6 +394,60 @@ namespace Microsoft.Crank.Controller
                 else
                 {
                     await Task.Delay(1000);
+                }
+            }
+        }
+
+        private async Task HandleBuildFileAsync(string buildFileValue)
+        {
+            var buildFileSegments = buildFileValue.Split(';', 2, StringSplitOptions.RemoveEmptyEntries);
+
+            var isRemoteFile = buildFileSegments[0].StartsWith("http", StringComparison.OrdinalIgnoreCase);
+
+            if (isRemoteFile)
+            {
+                var downloadFiles = buildFileSegments[0];
+
+                var fileName = downloadFiles[(downloadFiles.LastIndexOf('/') + 1)..];
+                var downDestination = Path.Combine(Path.GetTempPath(), fileName);
+
+                Log.Write($"Downloading build file from '{downloadFiles}' to '{downDestination}'");
+
+                await _httpClient.DownloadFileAsync(downloadFiles, _serverJobUri, downDestination);
+
+                if (buildFileSegments.Length > 1)
+                {
+                    downDestination += ";" + buildFileSegments[1] + "/" + Path.GetFileName(downDestination);
+                }
+
+                var result = await UploadFileAsync(downDestination, _serverJobUri + "/build");
+
+                if (result != 0)
+                {
+                    throw new Exception("Error while uploading build files");
+                }
+            }
+            else
+            {
+                var localFiles = buildFileSegments[0];
+                var shouldSearchRecursively = localFiles.Contains("**");
+                localFiles = localFiles.Replace("**\\", "").Replace("**/", "");
+
+                foreach (var resolvedFile in Directory.GetFiles(Path.GetDirectoryName(localFiles), Path.GetFileName(localFiles), shouldSearchRecursively ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly))
+                {
+                    var resolvedFileWithDestination = resolvedFile;
+
+                    if (buildFileSegments.Length > 1)
+                    {
+                        resolvedFileWithDestination += ";" + buildFileSegments[1] + Path.GetDirectoryName(resolvedFile).Substring(Path.GetDirectoryName(localFiles).Length) + "/" + Path.GetFileName(resolvedFileWithDestination);
+                    }
+
+                    var result = await UploadFileAsync(resolvedFileWithDestination, _serverJobUri + "/build");
+
+                    if (result != 0)
+                    {
+                        throw new Exception("Error while uploading build files");
+                    }
                 }
             }
         }
@@ -588,9 +630,11 @@ namespace Microsoft.Crank.Controller
                 {
                     try
                     {
+                        var start = DateTime.UtcNow;
+
                         // Ping server job to keep it alive
                         Log.Verbose($"GET {_serverJobUri}/touch...");
-                        var response = await _httpClient.GetAsync(Combine(_serverJobUri, "/touch"), new CancellationTokenSource(2000).Token);
+                        var response = await _httpClient.GetAsync(Combine(_serverJobUri, "/touch"), new CancellationTokenSource(_keepAliveTimeoutMilliseconds).Token);
 
                         // Detect if the job has timed out. This doesn't account for any other service
                         if (Job.Timeout > 0 && _runningUtc != null && DateTime.UtcNow - _runningUtc > TimeSpan.FromSeconds(Job.Timeout))
@@ -599,7 +643,13 @@ namespace Microsoft.Crank.Controller
                             await StopAsync();
                         }
 
-                        await Task.Delay(2000);
+                        var timeTakenForPing = (int)(DateTime.UtcNow - start).TotalMilliseconds;
+
+                        // To send a ping every 2s (_keepAlivePeriodMilliseconds) we substract the time taken to execute the previous ping
+                        if (timeTakenForPing < _keepAlivePeriodMilliseconds)
+                        {
+                            await Task.Delay(_keepAlivePeriodMilliseconds - timeTakenForPing);
+                        }
                     }
                     catch (Exception e)
                     {
@@ -910,7 +960,7 @@ namespace Microsoft.Crank.Controller
                 Console.WriteLine(markdownResult.Value.Replace("**", ""));
             }
         }
-        private static void DoCreateFromDirectory(string sourceDirectoryName, string destinationArchiveFileName)
+        private void DoCreateFromDirectory(string sourceDirectoryName, string destinationArchiveFileName)
         {
             sourceDirectoryName = Path.GetFullPath(sourceDirectoryName);
 
@@ -928,18 +978,26 @@ namespace Microsoft.Crank.Controller
             {
                 var basePath = di.FullName;
 
-                var ignoreFile = IgnoreFile.Parse(Path.Combine(sourceDirectoryName, ".gitignore"), includeParentDirectories: true);
+                var ignoreFile = Job.Options.NoGitIgnore
+                    ? new IgnoreFile()
+                    : IgnoreFile.Parse(Path.Combine(sourceDirectoryName, ".gitignore"))
+                    ;
+
+                if (ignoreFile.Rules.Any())
+                {
+                    Log.Verbose(".gitignore file found");
+                }
 
                 foreach (var gitFile in ignoreFile.ListDirectory(sourceDirectoryName))
                 {
                     var localPath = gitFile.Path.Substring(sourceDirectoryName.Length);
                     Log.Verbose($"Adding {localPath}");
-                    var entry = archive.CreateEntryFromFile(gitFile.Path, localPath);
+                    archive.CreateEntryFromFile(gitFile.Path, localPath);
                 }
             }
         }
 
-        private async Task<int> UploadFileAsync(string filename, string uri)
+        private async Task<int> UploadFileAsync(string filename, string uri, bool gzipped = true)
         {
             try
             {
@@ -966,10 +1024,14 @@ namespace Microsoft.Crank.Controller
                         : new FileStream(uploadFilename, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 1, FileOptions.Asynchronous | FileOptions.SequentialScan)
                         ;
 
-                    using (var fileContent = new StreamContent(fileStream))
+                    // Use a 1MB buffer instead of the default one (80K)
+                    // The buffer is pooled internally, and on slow networks (VPN) upload can be slower
+
+                    using (var fileContent = new StreamContent(fileStream, _uploadBufferSize))
                     {
                         request.Content = fileContent;
-                        if (Job.ServerVersion >= 5)
+
+                        if (Job.ServerVersion >= 5 && gzipped)
                         {
                             request.Content = new CompressedContent(request.Content);
                         }
@@ -1173,7 +1235,7 @@ namespace Microsoft.Crank.Controller
                     var uri = Combine(_serverJobUri, "/download?path=" + HttpUtility.UrlEncode(f));
                     Log.Verbose("GET " + uri);
 
-                    var filename = Path.Combine(output ?? "", Path.GetDirectoryName(file), f);
+                    var filename = Path.Combine(output ?? "", f);
                     filename = Path.GetFullPath(filename);
 
                     if (!Directory.Exists(Path.GetDirectoryName(filename)))
@@ -1191,7 +1253,12 @@ namespace Microsoft.Crank.Controller
                 var uri = Combine(_serverJobUri, "/download?path=" + HttpUtility.UrlEncode(file));
                 Log.Verbose("GET " + uri);
 
-                var filename = Path.Combine(output ?? "", file);
+                if (file.StartsWith("~/") || file.StartsWith("~\\"))
+                {
+                    file = file.Substring(2);
+                }
+
+                var filename = Path.Combine(output ?? "", Path.GetFileName(file));
                 filename = Path.GetFullPath(filename);
 
                 if (!Directory.Exists(Path.GetDirectoryName(filename)))

@@ -5,23 +5,25 @@
 using System;
 using System.Text;
 using System.Text.Json;
-using System.Text.Json.Serialization;
 
 namespace Microsoft.Crank.AzureDevOpsWorker
 {
 
     public class JobPayload
     {
-        private static TimeSpan DefaultJobTimeout = TimeSpan.FromMinutes(10);
-        private static JsonSerializerOptions _serializationOptions = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+        private static readonly TimeSpan DefaultJobTimeout = TimeSpan.FromMinutes(10);
+        private static readonly JsonSerializerOptions _serializationOptions;
 
-        [JsonConverter(typeof(TimeSpanConverter))]
+        static JobPayload()
+        {
+            _serializationOptions = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+            _serializationOptions.Converters.Add(new TimeSpanConverter());
+        }
+
         public TimeSpan Timeout { get; set; } = DefaultJobTimeout;
 
         public string Name { get; set; }
         public string[] Args { get; set; }
-
-        public string RawPayload { get; set; }
 
         // A JavaScript condition that must evaluate to true. "job" 
         public string Condition { get; set; }
@@ -34,17 +36,30 @@ namespace Microsoft.Crank.AzureDevOpsWorker
 
                 // Azure Devops adds a DataContractSerializer preamble to the message, and also
                 // an invalid JSON char at the end of the message
-                str = str.Substring(str.IndexOf("{"));
+
+                // Example: @strin3http://schemas.microsoft.com/2003/10/Serialization/�{{ "name": "crank", ...
+
+                var index = -1;
+                do
+                {
+                    index = str.IndexOf('{', index + 1);
+
+                    if (index == -1 || index >= str.Length)
+                    {
+                        throw new InvalidOperationException("Couldn't find beginning of JSON document.");
+                    }
+                }
+                while (!char.IsWhiteSpace(str[index + 1]) && str[index + 1] != '\"');                
+                
+                str = str.Substring(index);
                 str = str.Substring(0, str.LastIndexOf("}") + 1);
                 var result = JsonSerializer.Deserialize<JobPayload>(str, _serializationOptions);
-
-                result.RawPayload = str;
 
                 return result;
             }
             catch (Exception e)
             {
-                throw new Exception("Error while parsing message body: " + Encoding.UTF8.GetString(data), e);
+                throw new Exception($"Error while parsing message body: {Convert.ToHexString(data)}", e);
             }
         }
     }

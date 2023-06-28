@@ -1,7 +1,7 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFrameworks>net5.0;net6.0</TargetFrameworks>
+    <TargetFrameworks>net6.0;net7.0</TargetFrameworks>
     <Description>Runs benchmarks out of GitHub pull-requests.</Description>
     <ToolCommandName>crank-pr</ToolCommandName>
     <AssemblyName>crank-pr</AssemblyName>
@@ -25,21 +25,10 @@
 
   <ItemGroup>
     <PackageReference Include="System.CommandLine" Version="2.0.0-beta1.20427.1" />
-    <PackageReference Include="Octokit" Version="0.48.0" />
-    <PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="6.8.0" />
+    <PackageReference Include="Octokit" Version="$(OctokitVersion)" />
     <PackageReference Include="Newtonsoft.Json" Version="$(JsonNetVersion)" />
     <PackageReference Include="YamlDotNet" Version="8.1.2" />
-    <PackageReference Include="Manatee.Json" Version="13.0.5" />
     <PackageReference Include="Fluid.Core" Version="2.2.6" />
-
-    <!-- Force version for Component Governance compliance -->
-    <PackageReference Include="System.Net.Http" Version="4.3.4">
-      <AllowExplicitReference>true</AllowExplicitReference>
-    </PackageReference>
-    <PackageReference Include="System.Text.Encodings.Web" Version="4.7.2">
-      <AllowExplicitReference>true</AllowExplicitReference>
-    </PackageReference>
-    
   </ItemGroup>
 
   <ItemGroup>
