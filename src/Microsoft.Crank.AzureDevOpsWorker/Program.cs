@@ -107,10 +107,12 @@ namespace Microsoft.Crank.AzureDevOpsWorker
 
                 if (records == null)
                 {
-                    Console.ForegroundColor = ConsoleColor.DarkRed;
-                    Console.WriteLine($"{LogNow} Could not retrieve records...");
-                    Console.ResetColor();
+                    await devopsMessage?.SendTaskCompletedEventAsync(DevopsMessage.ResultTypes.Skipped);
 
+                    Console.WriteLine($"{LogNow} Could not retrieve Records, skipping...");
+
+                    // Release the message for further processing
+                    await args.AbandonMessageAsync(message);
                     return;
                 }
 
@@ -158,54 +160,76 @@ namespace Microsoft.Crank.AzureDevOpsWorker
                     if (Verbose)
                     {
                         Console.WriteLine($"{LogNow} Invoking crank with timeout: {jobPayload.Timeout}");
-                    }                       
+                    }
 
-                    // The DriverJob manages the application's lifetime and standard output
-                    driverJob = new Job("crank", arguments);
+                    var retries = 0;
 
-                    driverJob.OnStandardOutput = log => Console.WriteLine(log);
-
-                    driverJob.Start();
-
-                    // Pump application standard output while it's running
-                    while (driverJob.IsRunning)
+                    do
                     {
-                        if ((DateTime.UtcNow - driverJob.StartTimeUtc) > jobPayload.Timeout)
+                        if (retries > 0)
                         {
-                            throw new Exception($"{LogNow} Job timed out ({jobPayload.Timeout}). The timeout can be increased in the queued message.");
+                            Console.WriteLine($"{LogNow} Job failed, attempt ({retries + 1} out of {jobPayload.Retries + 1}).");
                         }
 
-                        var logs = driverJob.FlushStandardOutput().ToArray();
+                        // The DriverJob manages the application's lifetime and standard output
+                        driverJob = new Job("crank", arguments);
 
-                        // Send any page of logs to the AzDo task log feed
-                        if (logs.Any())
+                        driverJob.OnStandardOutput = log => Console.WriteLine(log);
+
+                        driverJob.Start();
+
+                        // Pump application standard output while it's running
+                        while (driverJob.IsRunning)
                         {
-                            var success = await devopsMessage.SendTaskLogFeedsAsync(String.Join("\r\n", logs));
+                            var logs = driverJob.FlushStandardOutput().ToList();
 
-                            if (!success)
+                            // Has the job run for too long?
+                            if ((DateTime.UtcNow - driverJob.StartTimeUtc) > jobPayload.Timeout)
                             {
-                                Console.ForegroundColor = ConsoleColor.DarkYellow;
-                                Console.WriteLine($"{LogNow} SendTaskLogFeedsAsync failed. If the task was canceled, this jobs should be stopped.");
-                                Console.ResetColor();
+                                var timeoutMessage = $"{LogNow} Job timed out ({jobPayload.Timeout}). The timeout can be increased in the payload message.";
+
+                                Console.WriteLine(timeoutMessage);
+                                logs.Add(timeoutMessage);
 
                                 driverJob.Stop();
-                            }                                
+                            }
+
+                            // Send any page of logs to the AzDo task log feed
+                            if (logs.Any())
+                            {
+                                var success = await devopsMessage.SendTaskLogFeedsAsync(String.Join("\r\n", logs));
+
+                                if (!success)
+                                {
+                                    Console.ForegroundColor = ConsoleColor.DarkYellow;
+                                    Console.WriteLine($"{LogNow} SendTaskLogFeedsAsync failed. If the task was canceled, this jobs should be stopped.");
+                                    Console.ResetColor();
+                                }
+                            }
+
+                            // Check if task is still active (not canceled)
+
+                            records = await devopsMessage.GetRecordsAsync();
+
+                            // This can return a stale value (see DevopsMessage.RecordsCacheTimeSpan)
+
+                            record = records.Value.FirstOrDefault(x => x.Id == devopsMessage.TaskInstanceId);
+
+                            if (record != null && record?.State == "completed")
+                            {
+                                Console.WriteLine($"{LogNow} Job is completed ({record.Result}), interrupting...");
+
+                                driverJob.Stop();
+                            }
+                            else
+                            {
+                                await Task.Delay(TaskLogFeedDelay);
+                            }
                         }
 
-                        // Check if task is still active (not canceled)
-
-                        records = await devopsMessage.GetRecordsAsync();
-                        record = records.Value.FirstOrDefault(x => x.Id == devopsMessage.TaskInstanceId);
-
-                        if (record != null && record?.State == "completed")
-                        {
-                            Console.WriteLine($"{LogNow} Job is completed ({record.Result}), interrupting...");
-
-                            driverJob.Stop();
-                        }
-
-                        await Task.Delay(TaskLogFeedDelay);
+                        retries++;
                     }
+                    while (!driverJob.WasSuccessful && jobPayload.Retries >= retries);
 
                     // Mark the task as completed
                     await devopsMessage.SendTaskCompletedEventAsync(driverJob.WasSuccessful ? DevopsMessage.ResultTypes.Succeeded : DevopsMessage.ResultTypes.Failed);
@@ -247,7 +271,7 @@ namespace Microsoft.Crank.AzureDevOpsWorker
 
                 try
                 {
-                    await devopsMessage?.SendTaskCompletedEventAsync(DevopsMessage.ResultTypes.Failed);
+                    await devopsMessage?.SendTaskCompletedEventAsync(DevopsMessage.ResultTypes.SucceededWithIssues);
                 }
                 catch (Exception f)
                 {
@@ -256,7 +280,7 @@ namespace Microsoft.Crank.AzureDevOpsWorker
 
                 try
                 {
-                    // TODO: Should the message still be copmleted instead of abandonned?
+                    // TODO: Should the message still be completed instead of abandoned?
                     await args.AbandonMessageAsync(message);
                 }
                 catch (Exception f)

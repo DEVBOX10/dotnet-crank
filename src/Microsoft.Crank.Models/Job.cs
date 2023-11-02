@@ -5,6 +5,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Linq;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Converters;
 using Newtonsoft.Json.Linq;
@@ -70,11 +71,66 @@ namespace Microsoft.Crank.Models
         public TimeSpan BuildTime { get; set; }
         public long PublishedSize { get; set; }
 
+        [Obsolete("Source should be stored in Sources dictionary instead")]
+        [JsonProperty(Order = 999, ObjectCreationHandling = ObjectCreationHandling.Replace)]
+        // Getter and Setter is implemented for backwards compatibility with older configs and agents
+        public Source Source
+        {
+            get
+            {
+                if (Sources.Count == 0)
+                {
+                    return new Source();
+                }
+                else if (Sources.Count == 1)
+                {
+                    return Sources.Values.Single();
+                }
+                else
+                {
+                    return null;
+                }
+            }
+            set
+            {
+                if (value == null)
+                {
+                    return;
+                }
+
+                // Since source was intended to be cloned to the root of the working directory, set the destination to empty
+                value.DestinationFolder = "";
+                Sources = new Dictionary<string, Source> { [Source.DefaultSource] = value };
+                Project = value.Project;
+                DockerFile = value.DockerFile;
+                DockerPull = value.DockerPull;
+                DockerImageName = value.DockerImageName;
+                DockerCommand = value.DockerCommand;
+                DockerLoad = value.DockerLoad;
+                DockerContextDirectory = value.DockerContextDirectory;
+                DockerFetchPath = value.DockerFetchPath;
+                NoBuild = value.NoBuild;
+            }
+        }
+
         /// <summary>
         /// The source information for the benchmarked application
         /// </summary>
-        public Source Source { get; set; } = new Source();
+        public Dictionary<string, Source> Sources { get; set; } = new Dictionary<string, Source>();
+        public string BuildKey { get; set; }
+        public string Project { get; set; }
+        public string DockerFile { get; set; }
+        public string DockerPull { get; set; }
+        public string DockerImageName { get; set; }
+        public string DockerCommand { get; set; } // Optional command arguments for 'docker run'
+        public string DockerLoad { get; set; } // Relative to the docker folder
+        public string DockerContextDirectory { get; set; }
+        public string DockerFetchPath { get; set; }
 
+        /// <summary>
+        /// When SourceKey is defined, indicates whether a build should still occur. 
+        /// </summary>
+        public bool NoBuild { get; set; }
         public string Executable { get; set; }
         public string Arguments { get; set; }
         public bool NoArguments { get; set; } = true;
@@ -224,6 +280,77 @@ namespace Microsoft.Crank.Models
         /// Whether to patch the TFM of project references.
         /// </summary>
         public bool PatchReferences { get; set; } = false;
+
+        public bool IsDocker()
+        {
+            return !String.IsNullOrEmpty(DockerFile) || !String.IsNullOrEmpty(DockerImageName) || !String.IsNullOrEmpty(DockerPull);
+        }
+
+        public string GetNormalizedImageName()
+        {
+            if (!string.IsNullOrEmpty(DockerPull))
+            {
+                return DockerPull.ToLowerInvariant();
+            }
+
+            // If DockerLoad option is used, the image must be set to the one used to build it
+            if (!string.IsNullOrEmpty(DockerLoad))
+            {
+                return DockerImageName;
+            }
+
+            if (!string.IsNullOrEmpty(DockerImageName))
+            {
+                // If the docker image name already starts with benchmarks, reuse it
+                // This prefix is used to clean any dangling container that would not have been stopped automatically
+                if (DockerImageName.StartsWith("benchmarks_"))
+                {
+                    return DockerImageName;
+                }
+                else
+                {
+                    return $"benchmarks_{DockerImageName}".ToLowerInvariant();
+                }
+            }
+            else
+            {
+                return $"benchmarks_{System.IO.Path.GetFileNameWithoutExtension(DockerFile)}".ToLowerInvariant();
+            }
+        }
+
+        public BuildKeyData GetBuildKeyData()
+        {
+            return new BuildKeyData
+            {
+                Sources = Sources.ToDictionary(s => s.Key, s => (s.Value.DestinationFolder, s.Value.GetSourceKeyData())),
+                Project = Project,
+                RuntimeVersion = RuntimeVersion,
+                DesktopVersion = DesktopVersion,
+                AspNetCoreVersion = AspNetCoreVersion,
+                SdkVersion = SdkVersion,
+                Framework = Framework,
+                Channel = Channel,
+                PatchReferences = PatchReferences,
+                PackageReferences = PackageReferences,
+                NoGlobalJson = NoGlobalJson,
+                UseRuntimeStore = UseRuntimeStore,
+                BuildArguments = BuildArguments,
+                SelfContained = SelfContained,
+                Executable = Executable,
+                Collect = Collect,
+                UseMonoRuntime = UseMonoRuntime,
+                BuildFiles = Options.BuildFiles,
+                BuildArchives = Options.BuildArchives,
+                OutputFiles = Options.OutputFiles,
+                OutputArchives = Options.OutputArchives,
+                CollectDependencies = CollectDependencies,
+                DockerLoad = DockerLoad,
+                DockerPull = DockerPull,
+                DockerFile = DockerFile,
+                DockerImageName = DockerImageName,
+                DockerContextDirectory = DockerContextDirectory
+            };
+        }
     }
 
     /// <summary>
@@ -266,6 +393,39 @@ namespace Microsoft.Crank.Models
         public string DumpType { get; set; }
         public string DumpOutput { get; set; }
         public bool NoGitIgnore { get; set; }
+    }
 
+    /// <summary>
+    /// A class that stores all the properties that can be used as part of a cache key for the build.
+    /// </summary>
+    public class BuildKeyData
+    {
+        public Dictionary<string, (string DestinationFolder, SourceKeyData SourceKeyData)> Sources { get; set; }
+        public string Project { get; set; }
+        public string RuntimeVersion { get; set; }
+        public string DesktopVersion { get; set; }
+        public string AspNetCoreVersion { get; set; }
+        public string SdkVersion { get; set; }
+        public string Framework { get; set; }
+        public string Channel { get; set; }
+        public bool PatchReferences { get; set; }
+        public Dictionary<string, string> PackageReferences { get; set; }
+        public bool NoGlobalJson { get; set; }
+        public bool UseRuntimeStore { get; set; }
+        public List<string> BuildArguments { get; set; }
+        public bool SelfContained { get; set; }
+        public string Executable { get; set; }
+        public bool Collect { get; set; }
+        public string UseMonoRuntime { get; set; }
+        public List<string> BuildFiles { get; set; }
+        public List<string> BuildArchives { get; set; }
+        public List<string> OutputFiles { get; set; }
+        public List<string> OutputArchives { get; set; }
+        public bool CollectDependencies { get; set; }
+        public string DockerLoad { get; set; }
+        public string DockerPull { get; set; }
+        public string DockerFile { get; set; }
+        public string DockerImageName { get; set; }
+        public string DockerContextDirectory { get; set; }
     }
 }

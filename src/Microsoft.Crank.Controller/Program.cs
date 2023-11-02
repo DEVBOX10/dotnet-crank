@@ -83,6 +83,9 @@ namespace Microsoft.Crank.Controller
             _commandLinePropertyOption
             ;
 
+        private static CommandOption<ValueTuple<string, JToken>>
+            _variableJsonOption;
+
         // The dynamic arguments that will alter the configurations
         private static readonly List<KeyValuePair<string, string>> Arguments = new List<KeyValuePair<string, string>>();
 
@@ -147,6 +150,7 @@ namespace Microsoft.Crank.Controller
                 OptionsComparison = StringComparison.OrdinalIgnoreCase,
             };
 
+            app.ValueParsers.Add(new VariableParser());
             app.HelpOption("-?|-h|--help", true);
 
             _configOption = app.Option("-c|--config", "Configuration file or url.", CommandOptionType.MultipleValue);
@@ -158,6 +162,7 @@ namespace Microsoft.Crank.Controller
             _csvOption = app.Option("--csv", "Saves the results as csv in the specified file.", CommandOptionType.SingleValue);
             _compareOption = app.Option("--compare", "An optional filename to compare the results to. Can be used multiple times.", CommandOptionType.MultipleValue);
             _variableOption = app.Option("--variable", "Variable", CommandOptionType.MultipleValue);
+            _variableJsonOption = app.Option<ValueTuple<string, JToken>>("--variable-json", "Typed Variable", CommandOptionType.MultipleValue);
             _sqlConnectionStringOption = app.Option("--sql",
                 "Connection string or environment variable name of the SQL Server Database to store results in.", CommandOptionType.SingleValue);
             _sqlTableOption = app.Option("--table",
@@ -507,6 +512,14 @@ namespace Microsoft.Crank.Controller
                     }
                 }
 
+                if (_variableJsonOption.HasValue())
+                {
+                    foreach (var variable in _variableJsonOption.ParsedValues)
+                    {
+                        variables[variable.Item1] = variable.Item2;
+                    }
+                }
+
                 foreach (var property in _propertyOption.Values)
                 {
                     var segments = property.Split('=', 2);
@@ -541,13 +554,14 @@ namespace Microsoft.Crank.Controller
                     service.Origin = Environment.MachineName;
                     service.CrankArguments = _commandLineProperty;
 
-                    if (String.IsNullOrEmpty(service.Source.Project) &&
-                        String.IsNullOrEmpty(service.Source.DockerFile) &&
-                        String.IsNullOrEmpty(service.Source.DockerLoad) &&
+                    if (String.IsNullOrEmpty(service.Project) &&
+                        String.IsNullOrEmpty(service.DockerFile) &&
+                        String.IsNullOrEmpty(service.DockerLoad) &&
+                        String.IsNullOrEmpty(service.DockerPull) &&
                         String.IsNullOrEmpty(service.Executable))
                     {
                         Console.WriteLine($"The service '{jobName}' is missing some properties to start the job.");
-                        Console.WriteLine($"Check that any of these properties is set: project, executable, dockerFile, dockerLoad");
+                        Console.WriteLine($"Check that any of these properties is set: project, executable, dockerFile, dockerLoad, dockerPull");
                         return -1;
                     }
 
@@ -1974,29 +1988,36 @@ namespace Microsoft.Crank.Controller
 
                 if (job.Options.ReuseSource || job.Options.ReuseBuild)
                 {
-                    var source = job.Source;
-
-                    // Compute a custom source key
-                    source.SourceKey = source.Repository
-                        + source.Project
-                        + source.LocalFolder
-                        + source.BranchOrCommit
-                        + source.DockerImageName
-                        + source.DockerFile
-                        + source.InitSubmodules.ToString()
-                        + source.Repository
-                        ;
-
-                    using (var sha1 = SHA1.Create())
+                    // If all the sources have source keys, then we can also make a build key for the job
+                    var allSourcesHaveCaching = true;
+                    foreach (var (sourceName, source) in job.Sources)
                     {
-                        // Assume no collision since it's verified on the server
-                        var bytes = sha1.ComputeHash(Encoding.UTF8.GetBytes(job.Source.SourceKey));
-                        source.SourceKey = String.Concat(bytes.Select(b => b.ToString("x2"))).Substring(0, 8);
+                        if (!source.CacheOnAgent)
+                        {
+                            allSourcesHaveCaching = false;
+                            continue;
+                        }
+
+                        // If there is already a source key set, just use that
+                        if (string.IsNullOrEmpty(source.SourceKey))
+                        {
+                            source.SourceKey = HashKeyData(source.GetSourceKeyData());
+                        }
                     }
 
-                    if (job.Options.ReuseBuild)
+                    // If a source doesn't have caching enabled, then we can't use NoBuild
+                    if (allSourcesHaveCaching)
                     {
-                        source.NoBuild = true;
+                        // If the job has a build key set, use that
+                        if (string.IsNullOrEmpty(job.BuildKey))
+                        {
+                            job.BuildKey = HashKeyData(job.GetBuildKeyData());
+                        }
+
+                        if (job.Options.ReuseBuild)
+                        {
+                            job.NoBuild = true;
+                        }
                     }
                 }
 
@@ -2048,6 +2069,14 @@ namespace Microsoft.Crank.Controller
             }
 
             return result;
+        }
+
+        private static string HashKeyData<T>(T KeyData)
+        {
+            using var sha1 = SHA1.Create();
+            var keyDataStr = JsonConvert.SerializeObject(KeyData);
+            var hashedKeyDataBytes = sha1.ComputeHash(Encoding.UTF8.GetBytes(keyDataStr.ToString()));
+            return string.Concat(hashedKeyDataBytes.Select(b => b.ToString("x2"))).Substring(0, 8);
         }
 
         private static void ApplyTemplates(JToken node, TemplateContext templateContext)
@@ -3195,7 +3224,7 @@ namespace Microsoft.Crank.Controller
 
             if (string.IsNullOrEmpty(original))
             {
-                return original;
+                return "\"\"";
             }
 
             var value = Regex.Replace(original, @"(\\*)" + "\"", @"$1\$0");

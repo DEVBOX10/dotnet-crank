@@ -17,6 +17,7 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Xml.Linq;
@@ -33,14 +34,12 @@ using Microsoft.Diagnostics.Tools.Trace;
 using Microsoft.Diagnostics.Tracing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using NuGet.Versioning;
 using Repository;
 using Serilog;
 using Serilog.Events;
-using Serilog.Filters;
 using Serilog.Sinks.SystemConsole.Themes;
 using Vanara.PInvoke;
 using OperatingSystem = Microsoft.Crank.Models.OperatingSystem;
@@ -65,10 +64,11 @@ namespace Microsoft.Crank.Agent
             Based on the target framework
          */
 
-        private static readonly string DefaultTargetFramework = "net6.0";
+        private static readonly string DefaultTargetFramework = "net7.0";
         private static readonly string DefaultChannel = "current";
+        private const int CommitHashLength = 12;
 
-        private const string PerfViewVersion = "v3.0.7";
+        private const string PerfViewVersion = "v3.1.5";
 
         private static readonly HttpClient _httpClient;
         private static readonly HttpClientHandler _httpClientHandler;
@@ -80,25 +80,27 @@ namespace Microsoft.Crank.Agent
         private static readonly string _aspNetCoreDependenciesUrl = "https://raw.githubusercontent.com/aspnet/AspNetCore/{0}";
         private static readonly string _perfviewUrl = $"https://github.com/Microsoft/perfview/releases/download/{PerfViewVersion}/PerfView.exe";
 
-        private static readonly string _aspnet5FlatContainerUrl = "https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet5/nuget/v3/flat2/Microsoft.AspNetCore.App.Runtime.linux-x64/index.json";
         private static readonly string _aspnet6FlatContainerUrl = "https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet6/nuget/v3/flat2/Microsoft.AspNetCore.App.Runtime.linux-x64/index.json";
         private static readonly string _aspnet7FlatContainerUrl = "https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet7/nuget/v3/flat2/Microsoft.AspNetCore.App.Runtime.linux-x64/index.json";
         private static readonly string _aspnet8FlatContainerUrl = "https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet8/nuget/v3/flat2/Microsoft.AspNetCore.App.Runtime.linux-x64/index.json";
+        private static readonly string _aspnet9FlatContainerUrl = "https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet9/nuget/v3/flat2/Microsoft.AspNetCore.App.Runtime.linux-x64/index.json";
 
-        private static readonly string _netcore5FlatContainerUrl = "https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet5/nuget/v3/flat2/Microsoft.NetCore.App.Runtime.linux-x64/index.json";
         private static readonly string _netcore6FlatContainerUrl = "https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet6/nuget/v3/flat2/Microsoft.NetCore.App.Runtime.linux-x64/index.json";
         private static readonly string _netcore7FlatContainerUrl = "https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet7/nuget/v3/flat2/Microsoft.NetCore.App.Runtime.linux-x64/index.json";
         private static readonly string _netcore8FlatContainerUrl = "https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet8/nuget/v3/flat2/Microsoft.NetCore.App.Runtime.linux-x64/index.json";
+        private static readonly string _netcore9FlatContainerUrl = "https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet9/nuget/v3/flat2/Microsoft.NetCore.App.Runtime.linux-x64/index.json";
 
         // Safe-keeping these urls
         //private static readonly string _latestRuntimeApiUrl = "https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet5/nuget/v3/flat2/Microsoft.NetCore.App.Runtime.linux-x64/index.json";
         //private static readonly string _latestDesktopApiUrl = "https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet5/nuget/v3/flat2/Microsoft.NetCore.App.Runtime.win-x64/index.json";
         //private static readonly string _releaseMetadata = "https://dotnetcli.blob.core.windows.net/dotnet/release-metadata/releases-index.json";
 
-        private static readonly string _latestSdkVersionUrl = "https://aka.ms/dotnet/8.0.1xx/daily/productCommit-win-x64.txt";
+        private static readonly string _latestSdk80VersionUrl = "https://aka.ms/dotnet/8.0.1xx/daily/productCommit-win-x64.txt";
+        private static readonly string _latestSdk90VersionUrl = "https://aka.ms/dotnet/9.0.1xx/daily/productCommit-win-x64.txt";
 
         private static readonly string _aspnetSdkVersionUrl = "https://raw.githubusercontent.com/dotnet/aspnetcore/main/global.json";
         private static readonly string[] _runtimeFeedUrls = new string[] {
+            "https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet9/nuget/v3/flat2",
             "https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet8/nuget/v3/flat2",
             "https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet7/nuget/v3/flat2",
             "https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet6/nuget/v3/flat2",
@@ -119,9 +121,6 @@ namespace Microsoft.Crank.Agent
         private static string _perfviewPath;
         private static string _dotnetInstallPath;
 
-        // https://docs.docker.com/config/containers/resource_constraints/
-        private const double _defaultDockerCfsPeriod = 100000;
-
         private static readonly IJobRepository _jobs = new InMemoryJobRepository();
         private static string _rootTempDir;
 
@@ -129,8 +128,8 @@ namespace Microsoft.Crank.Agent
         private static string _dotnethome;
         private static bool _cleanup = true;
         private static Process perfCollectProcess;
-        private static readonly object v = new();
-        private static readonly object _synLock = v;
+        private static readonly object _synLock = new();
+        private static object _consoleLock = new();
 
         private static Task dotnetTraceTask;
         private static ManualResetEvent dotnetTraceManualReset;
@@ -146,6 +145,7 @@ namespace Microsoft.Crank.Agent
         public static TimeSpan CollectTimeout = TimeSpan.FromMinutes(5);
         public static CancellationTokenSource _processJobsCts;
         public static Task _processJobsTask;
+        public static CGroup CGroupVersion { get; private set; }
 
         private static string _startPerfviewArguments;
 
@@ -203,7 +203,7 @@ namespace Microsoft.Crank.Agent
             {
                 endpoints.MapGet("jobs/{id}/state", JobsApis.GetState);
                 endpoints.MapGet("jobs/{id}/touch", JobsApis.GetTouch);
-                
+
                 endpoints.MapDefaultControllerRoute();
             });
         }
@@ -280,7 +280,7 @@ namespace Microsoft.Crank.Agent
                 {
                     HardwareVersion = "Unspecified";
                 }
-                
+
                 if (hardwareOption.HasValue())
                 {
                     Hardware = hardwareOption.Value();
@@ -403,6 +403,7 @@ namespace Microsoft.Crank.Agent
                 hostTask = host.WaitForShutdownAsync();
             }
 
+            Log.Info($"Starting agent on {url}...");
 
             _processJobsCts = new CancellationTokenSource();
             _processJobsTask = ProcessJobs(hostname, dockerHostname, _processJobsCts.Token);
@@ -444,7 +445,7 @@ namespace Microsoft.Crank.Agent
                     Log.Info($"Found sdk {sdkVersion}");
                 }
             }
-            
+
             var runtimeLocation = Path.Combine(dotnethome, "shared", "Microsoft.NETCore.App");
 
             if (Directory.Exists(runtimeLocation))
@@ -486,7 +487,6 @@ namespace Microsoft.Crank.Agent
 
         private static async Task ProcessJobs(string hostname, string dockerHostname, CancellationToken cancellationToken)
         {
-
             try
             {
                 CreateTemporaryFolders();
@@ -573,7 +573,7 @@ namespace Microsoft.Crank.Agent
                             {
                                 continue;
                             }
-                            
+
                             var realCpuCount = Environment.ProcessorCount;
                             if (!string.IsNullOrEmpty(job.CpuSet))
                             {
@@ -600,6 +600,8 @@ namespace Microsoft.Crank.Agent
                             var startMonitorTime = context.StartMonitorTime;
 
                             var tempDir = context.TempDir;
+                            var tempDirUsesSourceKey = context.TempDirUsesSourceKey;
+                            var sourceDirs = context.SourceDirs;
                             var dockerImage = context.DockerImage;
                             var dockerContainerId = context.DockerContainerId;
 
@@ -621,37 +623,26 @@ namespace Microsoft.Crank.Agent
                                 }
                                 else
                                 {
-                                    tempDir = null;
-
-                                    if (!String.IsNullOrEmpty(job.Source.SourceKey))
+                                    foreach ((var sourceName, var source) in job.Sources)
                                     {
-                                        tempDir = Path.Combine(_rootTempDir, job.Source.SourceKey);
-
-                                        try
+                                        if (!String.IsNullOrEmpty(source.SourceKey))
                                         {
-                                            if (!Directory.Exists(tempDir))
-                                            {
-                                                Log.Info("Creating source folder: " + tempDir);
-                                                Directory.CreateDirectory(tempDir);
-                                            }
-                                            else
-                                            {
-                                                Log.Info("Found source folder: " + tempDir);
-
-                                                // Force the controller to not send the local folder
-                                                job.Source.LocalFolder = null;
-                                            }
-                                        }
-                                        catch
-                                        {
-                                            Log.Warning("[WARNING] Invalid source folder name: " + tempDir);
-                                            tempDir = null;
+                                            var sourceTempDir = Path.Combine(_rootTempDir, source.SourceKey);
+                                            sourceDirs[sourceName] = sourceTempDir;
+                                            EnsureSourceFolderExists(sourceTempDir, source);
                                         }
                                     }
 
-                                    if (tempDir == null)
+                                    if (!String.IsNullOrEmpty(job.BuildKey))
+                                    {
+                                        tempDir = Path.Combine(_rootTempDir, job.BuildKey);
+                                        tempDirUsesSourceKey = true;
+                                        EnsureSourceFolderExists(tempDir);
+                                    }
+                                    else
                                     {
                                         tempDir = GetTempDir();
+                                        tempDirUsesSourceKey = false;
                                     }
 
                                     startMonitorTime = DateTime.UtcNow;
@@ -756,6 +747,20 @@ namespace Microsoft.Crank.Agent
                                             Format = "n0",
                                             LongDescription = "The size of the published application (KB)",
                                             ShortDescription = "Published Size (KB)"
+                                        });
+                                    }
+
+                                    if (!job.Metadata.Any(x => x.Name == Measurements.BenchmarksPublishedNativeAOTSizeRaw))
+                                    {
+                                        job.Metadata.Enqueue(new MeasurementMetadata
+                                        {
+                                            Source = "Host Process",
+                                            Name = Measurements.BenchmarksPublishedNativeAOTSizeRaw,
+                                            Aggregate = Operation.All,
+                                            Reduce = Operation.All,
+                                            Format = "json",
+                                            LongDescription = "The size summary of the published native aot application",
+                                            ShortDescription = "Native Aot Size summary"
                                         });
                                     }
 
@@ -878,7 +883,7 @@ namespace Microsoft.Crank.Agent
                                     var cts = new CancellationTokenSource();
                                     Task buildAndRunTask;
 
-                                    if (job.Source.IsDocker())
+                                    if (job.IsDocker())
                                     {
                                         buildAndRunTask = Task.Run(async () =>
                                         {
@@ -1012,7 +1017,7 @@ namespace Microsoft.Crank.Agent
                                                         }
                                                     }
 
-                                                    if (job.Source.IsDocker())
+                                                    if (job.IsDocker())
                                                     {
                                                         // Check the container is still running
                                                         var inspectResult = ProcessUtil.RunAsync("docker", "inspect -f {{.State.Running}} " + dockerContainerId,
@@ -1163,7 +1168,7 @@ namespace Microsoft.Crank.Agent
                                                             // TODO: Accessing the TotalProcessorTime on OSX throws so just leave it as 0 for now
                                                             // We need to dig into this
                                                             Process trackProcess = null;
-                                                            
+
                                                             if (job.ChildProcessId != 0)
                                                             {
                                                                 try
@@ -1197,7 +1202,7 @@ namespace Microsoft.Crank.Agent
                                                                 var newCPUTime = OperatingSystem == OperatingSystem.OSX
                                                                     ? TimeSpan.Zero
                                                                     : trackProcess.TotalProcessorTime;
-                                                                                                                        
+
                                                                 var elapsed = now.Subtract(lastMonitorTime).TotalMilliseconds;
                                                                 var rawCpu = (newCPUTime - oldCPUTime).TotalMilliseconds / elapsed * 100;
                                                                 var cpu = Math.Round(rawCpu / realCpuCount);
@@ -1504,26 +1509,28 @@ namespace Microsoft.Crank.Agent
                                 // Delete the benchmarks group
                                 if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux) && (job.MemoryLimitInBytes > 0 || job.CpuLimitRatio > 0 || !String.IsNullOrEmpty(job.CpuSet)))
                                 {
-                                    var controller = GetCGroupController(job);
+                                    if (CGroupVersion == null)
+                                    {
+                                        CGroupVersion = await CGroup.GetCGroupVersionAsync();
+                                    }
 
                                     // Read cpu throttling stats
 
                                     string cpuStats;
 
-                                    if (job.Source.IsDocker())
+                                    if (job.IsDocker())
                                     {
                                         var result = await ProcessUtil.RunAsync("docker", $"exec {dockerContainerId} cat /sys/fs/cgroup/cpu/cpu.stat", throwOnError: false, captureOutput: true);
                                         cpuStats = result.StandardOutput;
                                     }
                                     else
                                     {
-                                        var result = await ProcessUtil.RunAsync("cat", $"/sys/fs/cgroup/cpu/{controller}/cpu.stat", throwOnError: false, captureOutput: true);
-                                        cpuStats = result.StandardOutput;
+                                        cpuStats = await CGroupVersion.GetCpuStatAsync(job);
                                     }
 
                                     MeasureCpuStats(cpuStats, job);
 
-                                    await ProcessUtil.RunAsync("cgdelete", $"cpu,memory,cpuset:{controller}", log: true, throwOnError: false);
+                                    await CGroupVersion.DeleteAsync(job);
                                 }
 
                                 StopCounters();
@@ -1538,7 +1545,7 @@ namespace Microsoft.Crank.Agent
                                     {
                                         if (job.Collect)
                                         {
-                                            // Abort all perfview processes
+                                            // Abort all Perfview processes
                                             if (OperatingSystem == OperatingSystem.Windows)
                                             {
                                                 var perfViewProcess = RunPerfview("abort", Path.GetPathRoot(_perfviewPath));
@@ -1599,20 +1606,9 @@ namespace Microsoft.Crank.Agent
                                     {
                                         if (!process.HasExited)
                                         {
-                                            Log.Info($"Sending CTRL+C ...");
+                                            Log.Info("Sending CTRL+C ...");
 
-                                            // Disable CTRL handling for the Agent, or the CTRL+C would stop it too
-                                            SetConsoleCtrlHandler(null, true);
-                                            GenerateConsoleCtrlEvent(CtrlTypes.CTRL_C_EVENT, (uint)process.Id);
-
-                                            var waitForShutdownDelay = Task.Delay(TimeSpan.FromSeconds(5));
-                                            while (!process.HasExited && !waitForShutdownDelay.IsCompletedSuccessfully)
-                                            {
-                                                await Task.Delay(200);
-                                            }
-
-                                            // Enable CTRL handling for the Agent
-                                            SetConsoleCtrlHandler(null, false);
+                                            SendCtrlCSignalToProcess(process);
                                         }
                                     }
 
@@ -1624,13 +1620,13 @@ namespace Microsoft.Crank.Agent
                                             var response = await _httpClient.GetAsync(new Uri(new Uri(job.Url), "/shutdown"));
 
                                             // Shutdown invoked successfully, wait for the application to stop by itself
-                                            if (response.StatusCode == System.Net.HttpStatusCode.OK)
+                                            if (response.StatusCode == HttpStatusCode.OK)
                                             {
                                                 var epoch = DateTime.UtcNow;
 
                                                 do
                                                 {
-                                                    Log.Info($"Shutdown successfully invoked, waiting for graceful shutdown ...");
+                                                    Log.Info("Shutdown successfully invoked, waiting for graceful shutdown ...");
                                                     await Task.Delay(1000);
 
                                                 } while (!process.HasExited && (DateTime.UtcNow - epoch < TimeSpan.FromSeconds(5)));
@@ -1677,16 +1673,20 @@ namespace Microsoft.Crank.Agent
                                         job.ExitCode = process.ExitCode;
                                     }
 
-                                    Log.Info($"Process has stopped");
+                                    Log.Info($"Process has stopped ({job.Service}:{job.Id})");
 
 
                                     job.State = JobState.Stopped;
 
                                     process = null;
                                 }
-                                else if (job.Source.IsDocker())
+                                else if (job.IsDocker())
                                 {
                                     await DockerCleanUpAsync(dockerContainerId, dockerImage, job);
+                                }
+                                else
+                                {
+                                    job.State = JobState.Stopped;
                                 }
 
                                 // Run scripts after the benchmark is stopped
@@ -1705,7 +1705,7 @@ namespace Microsoft.Crank.Agent
                                     // if there is an AfterScript
                                 }
 
-                                Log.Info($"Process stopped ({job.State})");
+                                Log.Info($"Process stopped ({job.State} {job.Service}:{job.Id})");
                             }
 
                             async Task DeleteJobAsync()
@@ -1716,7 +1716,7 @@ namespace Microsoft.Crank.Agent
                                 }
                                 finally
                                 {
-                                    if (_cleanup && !job.NoClean && String.IsNullOrEmpty(job.Source.SourceKey) && tempDir != null)
+                                    if (_cleanup && !job.NoClean && !tempDirUsesSourceKey && tempDir != null)
                                     {
                                         // Delete traces
 
@@ -1724,7 +1724,6 @@ namespace Microsoft.Crank.Agent
                                         TryDeleteFile(job.PerfViewTraceFile);
 
                                         // Delete application folder
-
                                         await TryDeleteDirAsync(tempDir);
                                     }
 
@@ -1753,6 +1752,8 @@ namespace Microsoft.Crank.Agent
                             context.StartMonitorTime = startMonitorTime;
 
                             context.TempDir = tempDir;
+                            context.TempDirUsesSourceKey = tempDirUsesSourceKey;
+                            context.SourceDirs = sourceDirs;
                             context.DockerImage = dockerImage;
                             context.DockerContainerId = dockerContainerId;
 
@@ -1771,6 +1772,31 @@ namespace Microsoft.Crank.Agent
             catch (Exception e)
             {
                 Log.Error(e, $"Unexpected error");
+            }
+        }
+
+        private static void EnsureSourceFolderExists(string sourceTempDir, Source source = null)
+        {
+            try
+            {
+                if (!Directory.Exists(sourceTempDir))
+                {
+                    Log.Info("Creating source folder: " + sourceTempDir);
+                    Directory.CreateDirectory(sourceTempDir);
+                }
+                else
+                {
+                    Log.Info("Found source folder: " + sourceTempDir);
+                    if (source is not null)
+                    {
+                        // Force the controller to not send the local folder
+                        source.LocalFolder = null;
+                    }
+                }
+            }
+            catch
+            {
+                Log.Warning("[WARNING] Invalid source folder name: " + sourceTempDir);
             }
         }
 
@@ -1888,7 +1914,7 @@ namespace Microsoft.Crank.Agent
                 ? job.CollectTimeout
                 : CollectTimeout
                 ;
-                
+
             var delay = Task.Delay(collectTimeout);
 
             while (!perfCollectProcess.HasExited && !delay.IsCompletedSuccessfully)
@@ -1947,112 +1973,24 @@ namespace Microsoft.Crank.Agent
 
         private static async Task<(string containerId, string imageName, string workingDirectory)> DockerBuildAndRun(string path, Job job, string hostname, CancellationToken cancellationToken = default(CancellationToken))
         {
-            var source = job.Source;
-            string srcDir = path;
-
-            var reuseFolder = false;
-
-            // Is the path a previously created source folder?
-            if (!String.IsNullOrEmpty(job.Source.SourceKey))
-            {
-                // Check the source options are the same (repos, branch, ...)
-                var optionsPath = Path.Combine(path, "options.json");
-                
-                if (File.Exists(optionsPath))
-                {
-                    var content = File.ReadAllText(optionsPath);
-                    var options = JsonConvert.DeserializeObject<Source>(content);
-
-                    if (options.Project != job.Source.Project
-                    || options.Repository != job.Source.Repository
-                    || options.BranchOrCommit != job.Source.BranchOrCommit)
-                    {
-                        Log.Info("[INFO] Ignoring existing source folder as it's not matching the request source settings");
-                        reuseFolder = false;
-                    }
-                    else
-                    {
-                        reuseFolder = true;
-
-                        var localRepositoryFolder = new DirectoryInfo(Directory.GetDirectories(path).FirstOrDefault(x => !x.EndsWith("buildtools"))).Name;
-                        srcDir = Path.Combine(path, localRepositoryFolder);
-
-                        Log.Info($"Reusing cloned repository in {srcDir}");
-                    }
-                }
-                else
-                {
-                    Log.Info($"Creating reuse options.json file");
-
-                    // First time using this folder
-                    File.WriteAllText(optionsPath, JsonConvert.SerializeObject(job.Source));
-                    reuseFolder = false;
-                }
-            }
-
             // Docker image names must be lowercase
-            var imageName = source.GetNormalizedImageName();
+            var imageName = job.GetNormalizedImageName();
 
-            if (source.SourceCode != null)
+            var reuseFolder = await RetrieveSourcesAsync(job, path);
+
+            if (String.IsNullOrEmpty(job.DockerContextDirectory) && !String.IsNullOrEmpty(job.DockerFile))
             {
-                srcDir = Path.Combine(path, "src");
-
-                if (!reuseFolder)
-                {
-                    Log.Info($"Extracting source code to {srcDir}");
-
-                    ZipFile.ExtractToDirectory(job.Source.SourceCode.TempFilename, srcDir);
-                
-                    // Convert CRLF to LF on Linux
-                    if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
-                    {
-                        Log.Info($"Converting text files ...");
-
-                        foreach (var file in Directory.GetFiles(srcDir + Path.DirectorySeparatorChar, "*.*", SearchOption.AllDirectories))
-                        {
-                            ConvertLines(file);
-                        }
-                    }
-
-                    File.Delete(job.Source.SourceCode.TempFilename);
-                }
-            }
-            else if (!String.IsNullOrEmpty(source.Repository) && !reuseFolder)
-            {
-                var branchAndCommit = source.BranchOrCommit.Split('#', 2);
-
-                var dir = await Git.CloneAsync(path, source.Repository, shallow: branchAndCommit.Length == 1, branch: branchAndCommit[0]);
-
-                srcDir = Path.Combine(path, dir);
-
-                if (branchAndCommit.Length > 1)
-                {
-                    await Git.CheckoutAsync(srcDir, branchAndCommit[1]);
-                }
-
-                if (source.InitSubmodules)
-                {
-                    await Git.InitSubModulesAsync(srcDir);
-                }
-            }
-            else if (!reuseFolder)
-            {
-                srcDir = path;
+                job.DockerContextDirectory = Path.GetDirectoryName(job.DockerFile).Replace("\\", "/");
             }
 
-            if (String.IsNullOrEmpty(source.DockerContextDirectory))
-            {
-                source.DockerContextDirectory = Path.GetDirectoryName(source.DockerFile).Replace("\\", "/");
-            }
-
-            var workingDirectory = Path.Combine(srcDir, source.DockerContextDirectory);
+            var workingDirectory = Path.Combine(path, job.DockerContextDirectory ?? "");
 
             job.BasePath = workingDirectory;
 
             // Copy build files before building/publishing
             foreach (var attachment in job.BuildAttachments)
             {
-                var filename = Path.Combine(srcDir, attachment.Filename.Replace("\\", "/"));
+                var filename = Path.Combine(path, attachment.Filename.Replace("\\", "/"));
 
                 Log.Info($"Creating build file: {filename}");
 
@@ -2070,62 +2008,95 @@ namespace Microsoft.Crank.Agent
             var stopwatch = new Stopwatch();
             stopwatch.Start();
 
-            var requireBuild = !reuseFolder || !job.Source.NoBuild;
+            var requireBuild = !reuseFolder || !job.NoBuild;
 
             if (!requireBuild)
             {
                 Log.Info("Skipping build step, reusing previous build");
             }
             else
+            {
+                if (!string.IsNullOrEmpty(job.DockerLoad))
                 {
-                // The DockerLoad argument contains the path of a tar file that can be loaded
-                if (String.IsNullOrEmpty(source.DockerLoad))
-                {
-                    string buildParameters = "";
+                    // The DockerLoad argument contains the path of a tar file that can be loaded
 
-                    // Apply custom build arguments sent from the driver
-                    foreach (var argument in job.BuildArguments)
-                    {
-                        buildParameters += $"--build-arg {argument} ";
-                    }
+                    Log.Info($"Loading docker image {job.DockerLoad} from {path}");
 
-                    var dockerBuildArguments = $"build --pull {buildParameters} -t {imageName} -f {source.DockerFile} {workingDirectory}";
+                    var dockerLoadArguments = $"load -i {job.DockerLoad} ";
 
-                    job.BuildLog.AddLine("docker " + dockerBuildArguments);
+                    job.BuildLog.AddLine("docker " + dockerLoadArguments);
 
-                    var buildResults = await ProcessUtil.RunAsync("docker", dockerBuildArguments,
-                        workingDirectory: srcDir,
+                    await ProcessUtil.RunAsync("docker", dockerLoadArguments,
+                        workingDirectory: path,
                         cancellationToken: cancellationToken,
                         log: true,
-                        outputDataReceived: text => job.BuildLog.AddLine(text)
-                        );
+                        outputDataReceived: job.BuildLog.AddLine
+                    );
+                }
+                else
+                {
+                    var imageToRun = imageName;
+                    string buildParameters = "";
 
-                    stopwatch.Stop();
-
-                    job.BuildTime = stopwatch.Elapsed;
-
-                    job.Measurements.Enqueue(new Measurement
+                    if (!string.IsNullOrWhiteSpace(job.DockerPull))
                     {
-                        Name = Measurements.BenchmarksBuildTime,
-                        Timestamp = DateTime.UtcNow,
-                        Value = stopwatch.ElapsedMilliseconds
-                    });
+                        imageToRun = job.DockerPull;
 
-                    stopwatch.Reset();
+                        Log.Info($"Pulling docker image '{job.DockerPull}'");
 
-                    if (buildResults.ExitCode != 0)
+                        await ProcessUtil.RunAsync("docker", $"image pull {job.DockerPull}",
+                            workingDirectory: path,
+                            cancellationToken: cancellationToken,
+                            log: true,
+                            outputDataReceived: job.BuildLog.AddLine
+                            );
+                    }
+                    else
                     {
-                        job.Error = job.BuildLog.ToString();
+                        // Apply custom build arguments sent from the driver
+                        foreach (var argument in job.BuildArguments)
+                        {
+                            buildParameters += $"--build-arg {argument} ";
+                        }
+
+                        var dockerBuildArguments = $"build --pull {buildParameters} -t {imageName} -f {job.DockerFile} {workingDirectory}";
+
+                        job.BuildLog.AddLine("docker " + dockerBuildArguments);
+
+                        var buildResults = await ProcessUtil.RunAsync("docker", dockerBuildArguments,
+                            workingDirectory: path,
+                            cancellationToken: cancellationToken,
+                            log: true,
+                            outputDataReceived: job.BuildLog.AddLine
+                            );
+
+                        stopwatch.Stop();
+
+                        job.BuildTime = stopwatch.Elapsed;
+
+                        job.Measurements.Enqueue(new Measurement
+                        {
+                            Name = Measurements.BenchmarksBuildTime,
+                            Timestamp = DateTime.UtcNow,
+                            Value = stopwatch.ElapsedMilliseconds
+                        });
+
+                        stopwatch.Reset();
+
+                        if (buildResults.ExitCode != 0)
+                        {
+                            job.Error = job.BuildLog.ToString();
+                        }
                     }
 
-                    var dockerInspectArguments = $"inspect -f \"{{{{ .Size }}}}\" {imageName}";
+                    var dockerInspectArguments = $"inspect -f \"{{{{ .Size }}}}\" {imageToRun}";
 
                     var inspectResults = await ProcessUtil.RunAsync("docker", dockerInspectArguments,
-                        workingDirectory: srcDir,
+                        workingDirectory: path,
                         cancellationToken: cancellationToken,
                         captureOutput: true,
                         log: true,
-                        outputDataReceived: text => job.BuildLog.AddLine(text));
+                        outputDataReceived: job.BuildLog.AddLine);
 
                     if (long.TryParse(inspectResults.StandardOutput.Trim(), out var imageSize))
                     {
@@ -2141,21 +2112,6 @@ namespace Microsoft.Crank.Agent
                             });
                         }
                     }
-                }
-                else
-                {
-                    Log.Info($"Loading docker image {source.DockerLoad} from {srcDir}");
-
-                    var dockerLoadArguments = $"load -i {source.DockerLoad} ";
-
-                    job.BuildLog.AddLine("docker " + dockerLoadArguments);
-
-                    await ProcessUtil.RunAsync("docker", dockerLoadArguments,
-                        workingDirectory: srcDir,
-                        cancellationToken: cancellationToken,
-                        log: true,
-                        outputDataReceived: text => job.BuildLog.AddLine(text)
-                    );
                 }
             }
 
@@ -2183,12 +2139,12 @@ namespace Microsoft.Crank.Agent
                 environmentArguments += $"--env {env.Key}={env.Value} ";
             }
 
-            var containerName = $"{imageName}-{job.Id}";
+            var containerName = Regex.Replace(imageName, @"[^\w]", "_")+ $"-{job.Id}";
 
             // TODO: Clean previous images 
 
             // Stop container in case it failed to stop earlier
-            // await ProcessUtil.RunAsync("docker", $"stop {cont}", throwOnError: false);
+            // await ProcessUtil.RunAsync("docker", $"stop {containerName}", throwOnError: false);
 
             // Delete container if the same name already exists
             // await ProcessUtil.RunAsync("docker", $"rm {imageName}", throwOnError: false);
@@ -2200,7 +2156,7 @@ namespace Microsoft.Crank.Agent
 
             if (job.CpuLimitRatio > 0)
             {
-                environmentArguments += $"--cpu-quota=\"{Math.Floor(job.CpuLimitRatio * _defaultDockerCfsPeriod)}\" ";
+                environmentArguments += $"--cpu-quota=\"{Math.Floor(job.CpuLimitRatio * CGroup.DefaultDockerCfsPeriod)}\" ";
             }
 
             if (job.MemoryLimitInBytes > 0)
@@ -2208,9 +2164,7 @@ namespace Microsoft.Crank.Agent
                 environmentArguments += $"--memory=\"{job.MemoryLimitInBytes}b\" ";
             }
 
-            var command = OperatingSystem == OperatingSystem.Linux
-                ? $"run -d {environmentArguments} {job.Arguments} --label benchmarks --name {containerName} --privileged --network host {imageName} {source.DockerCommand}"
-                : $"run -d {environmentArguments} {job.Arguments} --label benchmarks --name {containerName} --network SELF --ip {hostname} {imageName} {source.DockerCommand}";
+            var command = $"run -d {environmentArguments} {job.Arguments} --label benchmarks --name {containerName} --privileged --network host {imageName} {job.DockerCommand}";
 
             if (job.Collect && job.CollectStartup)
             {
@@ -2219,12 +2173,12 @@ namespace Microsoft.Crank.Agent
 
             job.BuildLog.AddLine("docker " + command);
 
-            var result = await ProcessUtil.RunAsync("docker", $"{command} ", 
-                throwOnError: true, 
-                onStart: _ => stopwatch.Start(), 
+            var result = await ProcessUtil.RunAsync("docker", $"{command} ",
+                throwOnError: true,
+                onStart: _ => stopwatch.Start(),
                 captureOutput: true,
                 log: true,
-                outputDataReceived: text => job.BuildLog.AddLine(text)
+                outputDataReceived: job.BuildLog.AddLine
             );
 
             var containerId = result.StandardOutput.Trim();
@@ -2254,7 +2208,7 @@ namespace Microsoft.Crank.Agent
             };
 
             process.Start();
-            
+
             process.BeginOutputReadLine();
             process.BeginErrorReadLine();
 
@@ -2343,6 +2297,170 @@ namespace Microsoft.Crank.Agent
             }
 
             return (containerId, imageName, workingDirectory);
+        }
+
+        private static async Task<bool> RetrieveSourcesAsync(Job job, string path)
+        {
+            if (!string.IsNullOrEmpty(job.BuildKey))
+            {
+                var optionsDir = Path.Combine(_rootTempDir, "_options");
+                if (!Directory.Exists(optionsDir))
+                    Directory.CreateDirectory(optionsDir);
+
+                var optionsPath = Path.Combine(optionsDir, $"{job.BuildKey}.json");
+                var optionsData = JsonConvert.SerializeObject(job.GetBuildKeyData());
+
+                if (File.Exists(optionsPath))
+                {
+                    var cachedOptionsContent = File.ReadAllText(optionsPath);
+
+                    if (!String.Equals(optionsData, cachedOptionsContent))
+                    {
+                        Log.Info("[INFO] Ignoring existing build folder as it's not matching the request build settings");
+                    }
+                    else
+                    {
+                        Log.Info($"Reusing source folder in {path}");
+                        return true;
+                    }
+                }
+                else
+                {
+                    Log.Info($"Creating reuse options.json file");
+
+                    // First time using this folder
+                    File.WriteAllText(optionsPath, optionsData);
+                }
+            }
+
+            foreach (var (sourceName, source) in job.Sources)
+            {
+                var destinationFolder = Path.Combine(path, source.DestinationFolder ?? sourceName);
+                await RetrieveSourceAsync(source, destinationFolder);
+            }
+
+            return false;
+        }
+
+        private static async Task RetrieveSourceAsync(Source source, string destinationFolder)
+        {
+            if (!Directory.Exists(destinationFolder))
+                Directory.CreateDirectory(destinationFolder);
+
+            string targetDir = destinationFolder;
+
+            if (!String.IsNullOrEmpty(source.SourceKey))
+            {
+                var sourceFolder = Path.Combine(_rootTempDir, source.SourceKey);
+
+                var optionsDir = Path.Combine(_rootTempDir, "_options");
+                if (!Directory.Exists(optionsDir))
+                    Directory.CreateDirectory(optionsDir);
+
+                // An options file stores information about what is currently stored inside the folder with the given source key
+                var optionsPath = Path.Combine(optionsDir, $"{source.SourceKey}.json");
+                var optionsData = JsonConvert.SerializeObject(source.GetSourceKeyData());
+
+                if (File.Exists(optionsPath))
+                {
+                    // Verify that the cached options are equal, this prevents multiple users that have set explicit source keys
+                    // from reusing each other's sources
+                    var cachedOptionsContent = File.ReadAllText(optionsPath);
+                    if (!String.Equals(optionsData, cachedOptionsContent))
+                    {
+                        Log.Info("[INFO] Ignoring existing source folder as it's not matching the request source settings");
+                    }
+                    else
+                    {
+                        CopyDirectory(sourceFolder, destinationFolder);
+                        return;
+                    }
+                }
+                else
+                {
+                    // First time using this folder
+                    File.WriteAllText(optionsPath, optionsData);
+                    targetDir = sourceFolder;
+                }
+            }
+
+            if (source.SourceCode != null)
+            {
+                Log.Info($"Extracting source code to {targetDir}");
+
+                ZipFile.ExtractToDirectory(source.SourceCode.TempFilename, targetDir);
+
+                // Convert CRLF to LF on Linux
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+                {
+                    Log.Info($"Converting text files ...");
+
+                    foreach (var file in Directory.GetFiles(targetDir + Path.DirectorySeparatorChar, "*.*", SearchOption.AllDirectories))
+                    {
+                        ConvertLines(file);
+                    }
+                }
+
+                File.Delete(source.SourceCode.TempFilename);
+            }
+            else if (!String.IsNullOrEmpty(source.Repository))
+            {
+                var branchAndCommit = source.BranchOrCommit.Split('#', 2);
+
+                await Git.CloneAsync(targetDir, source.Repository, shallow: branchAndCommit.Length == 1, branch: branchAndCommit[0], intoCurrentDir: true);
+
+                if (branchAndCommit.Length > 1)
+                {
+                    await Git.CheckoutAsync(targetDir, branchAndCommit[1]);
+                }
+
+                if (source.InitSubmodules)
+                {
+                    await Git.InitSubModulesAsync(targetDir);
+                }
+            }
+
+            if (!targetDir.Equals(destinationFolder))
+            {
+                CopyDirectory(targetDir, destinationFolder);
+            }
+        }
+
+        // https://learn.microsoft.com/en-us/dotnet/standard/io/how-to-copy-directories
+        static void CopyDirectory(string sourceDir, string destinationDir, bool recursive = true)
+        {
+            if (string.Equals(sourceDir, destinationDir))
+                return;
+
+            // Get information about the source directory
+            var dir = new DirectoryInfo(sourceDir);
+
+            // Check if the source directory exists
+            if (!dir.Exists)
+                throw new DirectoryNotFoundException($"Source directory not found: {dir.FullName}");
+
+            // Cache directories before we start copying
+            DirectoryInfo[] dirs = dir.GetDirectories();
+
+            // Create the destination directory
+            Directory.CreateDirectory(destinationDir);
+
+            // Get the files in the source directory and copy to the destination directory
+            foreach (FileInfo file in dir.GetFiles())
+            {
+                string targetFilePath = Path.Combine(destinationDir, file.Name);
+                file.CopyTo(targetFilePath);
+            }
+
+            // If recursive and copying subdirectories, recursively call this method
+            if (recursive)
+            {
+                foreach (DirectoryInfo subDir in dirs)
+                {
+                    string newDestinationDir = Path.Combine(destinationDir, subDir.Name);
+                    CopyDirectory(subDir.FullName, newDestinationDir, true);
+                }
+            }
         }
 
         private static void ParseMeasurementOutput(Job job, RollingLog standardOutput)
@@ -2472,7 +2590,7 @@ namespace Microsoft.Crank.Agent
 
                     await ProcessUtil.RunAsync("docker", $"rm --force {containerId}", throwOnError: false);
 
-                    if (!String.IsNullOrEmpty(job.Source.SourceKey) && job.Source.NoBuild)
+                    if (!String.IsNullOrEmpty(job.BuildKey) && job.NoBuild)
                     {
                         Log.Info($"Keeping image {imageName}");
                     }
@@ -2503,141 +2621,37 @@ namespace Microsoft.Crank.Agent
 
         private static async Task<string> CloneRestoreAndBuild(string path, Job job, string dotnetHome, CancellationToken cancellationToken = default)
         {
-            // Clone
-            string benchmarkedDir = null;
-            var reuseFolder = false;
-
-            // Is the path a previously created source folder?
-            if (!String.IsNullOrEmpty(job.Source.SourceKey))
-            {
-                // Check the source options are the same (repos, branch, ...)
-                var optionsPath = Path.Combine(path, "options.json");
-                
-                if (File.Exists(optionsPath))
-                {
-                    var content = File.ReadAllText(optionsPath);
-                    var options = JsonConvert.DeserializeObject<Source>(content);
-
-                    if (options.Project != job.Source.Project
-                    || options.Repository != job.Source.Repository
-                    || options.BranchOrCommit != job.Source.BranchOrCommit)
-                    {
-                        Log.Info("[INFO] Ignoring existing source folder as it's not matching the request source settings");
-                        reuseFolder = false;
-                    }
-                    else
-                    {
-                        reuseFolder = true;
-
-                        // benchmarkedDir can be "src" or a local git clone folder
-                        benchmarkedDir = new DirectoryInfo(Directory.GetDirectories(path).FirstOrDefault(x => !x.EndsWith("buildtools"))).Name;
-                    }
-                }
-                else
-                {
-                    // First time using this folder
-                    File.WriteAllText(optionsPath, JsonConvert.SerializeObject(job.Source));
-                    reuseFolder = false;
-                }
-            }
-
-            if (!reuseFolder)
-            {
-                if (job.Source.SourceCode != null)
-                {
-                    benchmarkedDir = "src";
-
-                    var src = Path.Combine(path, benchmarkedDir);
-                    var published = Path.Combine(src, "published");
-
-                    if (String.IsNullOrEmpty(job.Executable))
-                    {
-                        Log.Info($"Extracting files to {src}");
-                        ZipFile.ExtractToDirectory(job.Source.SourceCode.TempFilename, src);
-                    }
-                    else
-                    {
-                        Log.Info($"Extracting files to {published}");
-                        ZipFile.ExtractToDirectory(job.Source.SourceCode.TempFilename, published);
-                    }
-
-                    File.Delete(job.Source.SourceCode.TempFilename);
-                }
-                else
-                {
-                    // It's possible that the user specified a custom branch/commit for the benchmarks repo,
-                    // so we need to add that to the set of sources to restore if it's not already there.
-                    //
-                    // Note that this is also going to de-dupe the repos if the same one was specified twice at
-                    // the command-line (last first to support overrides).
-                    var repositories = new HashSet<Source>(SourceRepoComparer.Instance);
-
-                    repositories.Add(job.Source);
-
-                    foreach (var source in repositories)
-                    {
-                        if (cancellationToken.IsCancellationRequested)
-                        {
-                            return null;
-                        }
-
-                        var branchAndCommit = source.BranchOrCommit.Split('#', 2);
-
-                        var dir = await Git.CloneAsync(path, source.Repository, shallow: branchAndCommit.Length == 1, branch: branchAndCommit[0], cancellationToken);
-
-                        var srcDir = Path.Combine(path, dir);
-
-                        if (SourceRepoComparer.Instance.Equals(source, job.Source))
-                        {
-                            benchmarkedDir = dir;
-                        }
-
-                        if (branchAndCommit.Length > 1)
-                        {
-                            await Git.CheckoutAsync(srcDir, branchAndCommit[1], cancellationToken);
-                        }
-
-                        if (source.InitSubmodules)
-                        {
-                            await Git.InitSubModulesAsync(srcDir, cancellationToken);
-                        }
-                    }
-                }
-            }
-
-            Debug.Assert(benchmarkedDir != null);
+            var reuseFolder = await RetrieveSourcesAsync(job, path);
 
             // Computes the location of the benchmarked app
-            var benchmarkedApp = Path.Combine(path, benchmarkedDir);
+            var benchmarkedApp = path;
 
-            if (!String.IsNullOrEmpty(job.Source.Project))
+            if (!String.IsNullOrEmpty(job.Project))
             {
-                benchmarkedApp = Path.Combine(benchmarkedApp, Path.GetDirectoryName(FormatPathSeparators(job.Source.Project)));
+                benchmarkedApp = Path.Combine(benchmarkedApp, Path.GetDirectoryName(FormatPathSeparators(job.Project)));
             }
 
             Log.Info($"Benchmarked Application in {benchmarkedApp}");
 
-            var commitHash = await Git.CommitHashAsync(benchmarkedApp, cancellationToken);
-
             // Skip installing dotnet or building project if not necessary
             var requireDotnetBuild =
-                !String.IsNullOrEmpty(job.Source.Project) ||
+                !String.IsNullOrEmpty(job.Project) ||
                 String.Equals("dotnet", job.Executable, StringComparison.OrdinalIgnoreCase)
             ;
 
             if (!requireDotnetBuild)
             {
                 Log.Info("Skipping build step, no required");
-                return benchmarkedDir;
+                return path;
             }
 
             // Skip installing dotnet or building project if already built and build is not requested
-            requireDotnetBuild = !reuseFolder || !job.Source.NoBuild;
+            requireDotnetBuild = !reuseFolder || !job.NoBuild;
 
             if (!requireDotnetBuild)
             {
                 Log.Info("Skipping build step, reusing previous build");
-                return benchmarkedDir;
+                return path;
             }
 
             var env = new Dictionary<string, string>
@@ -2671,7 +2685,7 @@ namespace Microsoft.Crank.Agent
 
             ConvertLegacyVersions(ref targetFramework, ref runtimeVersion, ref aspNetCoreVersion);
 
-            var projectFileName = Path.Combine(benchmarkedApp, Path.GetFileName(FormatPathSeparators(job.Source.Project)));
+            var projectFileName = Path.Combine(benchmarkedApp, Path.GetFileName(FormatPathSeparators(job.Project)));
 
             // If a specific framework is set, use it instead of the detected one
             if (!String.IsNullOrEmpty(job.Framework))
@@ -2693,10 +2707,19 @@ namespace Microsoft.Crank.Agent
             {
                 channel = job.Channel;
             }
-            // Until there is a GA version of net8.0, use "edge"
-            else if (targetFramework.Equals("net8.0"))
+            else
             {
-                channel = "edge";
+                // Until there is a GA version of net8.0, use "edge"
+
+                if (targetFramework.Equals("net8.0"))
+                {
+                    channel = "edge";
+                }
+                
+                if (targetFramework.Equals("net9.0"))
+                {
+                    channel = "edge";
+                }
             }
 
             if (String.IsNullOrEmpty(runtimeVersion))
@@ -2724,19 +2747,17 @@ namespace Microsoft.Crank.Agent
 
             runtimeVersion = await ResolveRuntimeVersion(buildToolsPath, targetFramework, runtimeVersion, currentRuntimeVersion);
 
-            sdkVersion = await ResolveSdkVersion(sdkVersion, currentSdkVersion);
+            sdkVersion = await ResolveSdkVersion(sdkVersion, currentSdkVersion, targetFramework);
 
             aspNetCoreVersion = await ResolveAspNetCoreVersion(aspNetCoreVersion, currentAspNetCoreVersion, targetFramework);
 
             sdkVersion = PatchOrCreateGlobalJson(job, benchmarkedApp, sdkVersion);
 
-            var installAspNetSharedFramework = job.UseRuntimeStore 
-                || aspNetCoreVersion.StartsWith("3.0") 
-                || aspNetCoreVersion.StartsWith("3.1") 
-                || aspNetCoreVersion.StartsWith("5.0")
+            var installAspNetSharedFramework = job.UseRuntimeStore
                 || aspNetCoreVersion.StartsWith("6.0")
                 || aspNetCoreVersion.StartsWith("7.0")
                 || aspNetCoreVersion.StartsWith("8.0")
+                || aspNetCoreVersion.StartsWith("9.0")
                 ;
 
             var dotnetInstallStep = "";
@@ -2746,7 +2767,7 @@ namespace Microsoft.Crank.Agent
             {
                 if (OperatingSystem == OperatingSystem.Windows)
                 {
-                    desktopVersion = await ResolveDestopVersion(desktopVersion, currentDesktopVersion);
+                    desktopVersion = await ResolveDesktopVersion(desktopVersion, currentDesktopVersion, targetFramework);
 
                     if (!_installedSdks.Contains(sdkVersion))
                     {
@@ -2756,7 +2777,7 @@ namespace Microsoft.Crank.Agent
                         // Install latest SDK version (and associated runtime)
 
                         ProcessResult result = null;
-                        
+
                         await ProcessUtil.RetryOnExceptionAsync(3, async () =>
                         {
                             if (!TryGetAzureFeedForPackage(PackageTypes.Sdk, sdkVersion, out dotnetFeed))
@@ -2766,7 +2787,7 @@ namespace Microsoft.Crank.Agent
 
                             result = await ProcessUtil.RunAsync("powershell", $"-NoProfile -ExecutionPolicy unrestricted [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; .\\dotnet-install.ps1 -Version {sdkVersion} -NoPath -SkipNonVersionedFiles -InstallDir {dotnetHome} -AzureFeed {dotnetFeed}",
                                 log: false,
-                                throwOnError: false, 
+                                throwOnError: false,
                                 workingDirectory: _dotnetInstallPath,
                                 environmentVariables: env,
                                 cancellationToken: cancellationToken);
@@ -2794,7 +2815,7 @@ namespace Microsoft.Crank.Agent
 
                         ProcessResult result = await ProcessUtil.RunAsync("powershell", $"-NoProfile -ExecutionPolicy unrestricted [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; .\\dotnet-install.ps1 -Version {runtimeVersion} -Runtime dotnet -NoPath -SkipNonVersionedFiles -InstallDir {dotnetHome} -AzureFeed {dotnetFeed}",
                                 log: false,
-                                throwOnError: false, 
+                                throwOnError: false,
                                 workingDirectory: _dotnetInstallPath,
                                 environmentVariables: env,
                                 cancellationToken: cancellationToken);
@@ -2809,41 +2830,35 @@ namespace Microsoft.Crank.Agent
 
                     try
                     {
-                        // This is not required for < 3.0
-                        var beforeDesktop = new[] { "netcoreapp2.1", "netcoreapp2.2", "netcoreapp3.0" };
-
-                        if (!beforeDesktop.Contains(targetFramework))
+                        if (!String.IsNullOrEmpty(desktopVersion)
+                            && !_installedDesktopRuntimes.Contains(desktopVersion)
+                            && !_ignoredDesktopRuntimes.Contains(desktopVersion))
                         {
-                            if (!String.IsNullOrEmpty(desktopVersion) 
-                                && !_installedDesktopRuntimes.Contains(desktopVersion) 
-                                && !_ignoredDesktopRuntimes.Contains(desktopVersion))
+                            dotnetInstallStep = $"Desktop runtime '{desktopVersion}'";
+                            Log.Info($"Installing {dotnetInstallStep} ...");
+
+                            if (!TryGetAzureFeedForPackage(PackageTypes.WindowsDesktop, desktopVersion, out dotnetFeed))
                             {
-                                dotnetInstallStep = $"Desktop runtime '{desktopVersion}'";
-                                Log.Info($"Installing {dotnetInstallStep} ...");
-
-                                if (!TryGetAzureFeedForPackage(PackageTypes.WindowsDesktop, desktopVersion, out dotnetFeed))
-                                {
-                                    throw new InvalidOperationException();
-                                }
-
-                                ProcessResult result = await ProcessUtil.RunAsync("powershell", $"-NoProfile -ExecutionPolicy unrestricted [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; .\\dotnet-install.ps1 -Version {desktopVersion} -Runtime windowsdesktop -NoPath -SkipNonVersionedFiles -InstallDir {dotnetHome} -AzureFeed {dotnetFeed}",
-                                        log: false,
-                                        throwOnError: false, 
-                                        workingDirectory: _dotnetInstallPath,
-                                        environmentVariables: env,
-                                        cancellationToken: cancellationToken);
-
-                                if (result.ExitCode != 0)
-                                {
-                                    throw new InvalidOperationException();
-                                }
-
-                                _installedDesktopRuntimes.Add(desktopVersion);
+                                throw new InvalidOperationException();
                             }
-                            else
+
+                            ProcessResult result = await ProcessUtil.RunAsync("powershell", $"-NoProfile -ExecutionPolicy unrestricted [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; .\\dotnet-install.ps1 -Version {desktopVersion} -Runtime windowsdesktop -NoPath -SkipNonVersionedFiles -InstallDir {dotnetHome} -AzureFeed {dotnetFeed}",
+                                    log: false,
+                                    throwOnError: false,
+                                    workingDirectory: _dotnetInstallPath,
+                                    environmentVariables: env,
+                                    cancellationToken: cancellationToken);
+
+                            if (result.ExitCode != 0)
                             {
-                                desktopVersion = SeekCompatibleDesktopRuntime(dotnetHome, targetFramework, desktopVersion);
+                                throw new InvalidOperationException();
                             }
+
+                            _installedDesktopRuntimes.Add(desktopVersion);
+                        }
+                        else
+                        {
+                            desktopVersion = SeekCompatibleDesktopRuntime(dotnetHome, targetFramework, desktopVersion);
                         }
                     }
                     catch
@@ -2874,7 +2889,7 @@ namespace Microsoft.Crank.Agent
 
                         ProcessResult result = await ProcessUtil.RunAsync("powershell", $"-NoProfile -ExecutionPolicy unrestricted [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; .\\dotnet-install.ps1 -Version {aspNetCoreVersion} -Runtime aspnetcore -NoPath -SkipNonVersionedFiles -InstallDir {dotnetHome} -AzureFeed {dotnetFeed}",
                                 log: false,
-                                throwOnError: false, 
+                                throwOnError: false,
                                 workingDirectory: _dotnetInstallPath,
                                 environmentVariables: env,
                                 cancellationToken: cancellationToken);
@@ -2897,7 +2912,7 @@ namespace Microsoft.Crank.Agent
                         // Install latest SDK version (and associated runtime)
 
                         ProcessResult result = null;
-                        
+
                         await ProcessUtil.RetryOnExceptionAsync(3, async () =>
                         {
                             if (!TryGetAzureFeedForPackage(PackageTypes.Sdk, sdkVersion, out dotnetFeed))
@@ -2907,7 +2922,7 @@ namespace Microsoft.Crank.Agent
 
                             result = await ProcessUtil.RunAsync("/usr/bin/env", $"bash dotnet-install.sh --version {sdkVersion} --no-path --skip-non-versioned-files --install-dir {dotnetHome} -AzureFeed {dotnetFeed}",
                                     log: false,
-                                    throwOnError: false, 
+                                    throwOnError: false,
                                     workingDirectory: _dotnetInstallPath,
                                     environmentVariables: env,
                                     cancellationToken: cancellationToken);
@@ -2963,7 +2978,7 @@ namespace Microsoft.Crank.Agent
 
                         ProcessResult result = await ProcessUtil.RunAsync("/usr/bin/env", $"bash dotnet-install.sh --version {aspNetCoreVersion} --runtime aspnetcore --no-path --skip-non-versioned-files --install-dir {dotnetHome} -AzureFeed {dotnetFeed}",
                                 log: false,
-                                throwOnError: false, 
+                                throwOnError: false,
                                 workingDirectory: _dotnetInstallPath,
                                 environmentVariables: env,
                                 cancellationToken: cancellationToken);
@@ -3042,7 +3057,7 @@ namespace Microsoft.Crank.Agent
                     {
                         Name = Measurements.BenchmarksAspNetCoreVersion,
                         Timestamp = DateTime.UtcNow,
-                        Value = $"{aspNetCoreVersion}+{aspnetCoreCommitHash.Substring(0, 7)}"
+                        Value = $"{aspNetCoreVersion}+{aspnetCoreCommitHash.Substring(0, CommitHashLength)}"
                     });
 
                     knownDependencies.Add(new Dependency { Names = new[] { "Microsoft.AspNetCore.App" }, CommitHash = aspnetCoreCommitHash, RepositoryUrl = "https://github.com/dotnet/aspnetcore", Version = aspNetCoreVersion });
@@ -3075,7 +3090,7 @@ namespace Microsoft.Crank.Agent
                     {
                         Name = Measurements.BenchmarksNetCoreAppVersion,
                         Timestamp = DateTime.UtcNow,
-                        Value = $"{runtimeVersion}+{netCoreAppCommitHash.Substring(0, 7)}"
+                        Value = $"{runtimeVersion}+{netCoreAppCommitHash.Substring(0, CommitHashLength)}"
                     });
 
                     knownDependencies.Add(new Dependency { Names = new[] { "Microsoft.NETCore.App" }, CommitHash = netCoreAppCommitHash, RepositoryUrl = "https://github.com/dotnet/runtime", Version = runtimeVersion });
@@ -3139,13 +3154,13 @@ namespace Microsoft.Crank.Agent
                 File.Delete(attachment.TempFilename);
             }
 
-            var outputFolder = Path.Combine(benchmarkedApp);
+            var outputFolder = benchmarkedApp;
 
             if (String.IsNullOrEmpty(job.Executable))
             {
                 outputFolder = Path.Combine(benchmarkedApp, "published");
 
-                var projectName = Path.GetFileName(FormatPathSeparators(job.Source.Project));
+                var projectName = Path.GetFileName(FormatPathSeparators(job.Project));
 
                 var arguments = $"publish {projectName} -c Release -o {outputFolder} {buildParameters}";
 
@@ -3226,6 +3241,18 @@ namespace Microsoft.Crank.Agent
             }
 
             Log.Info($"Published size: {job.PublishedSize}");
+
+            var dumperResult = MstatDumper.GetInfo(path);
+
+            if (dumperResult != null)
+            {
+                job.Measurements.Enqueue(new Measurement
+                {
+                    Name = Measurements.BenchmarksPublishedNativeAOTSizeRaw,
+                    Timestamp = DateTime.UtcNow,
+                    Value = dumperResult
+                });
+            }
 
             // Copy crossgen in the app folder
             if (job.Collect && OperatingSystem == OperatingSystem.Linux)
@@ -3362,14 +3389,19 @@ namespace Microsoft.Crank.Agent
 
             if (job.CollectDependencies)
             {
-                job.Dependencies = GetDependencies(job, outputFolder, aspNetCoreVersion, runtimeVersion, commitHash);
+                // This stores the git commit hash for where the project file is located
+                string projectGitCommitHash = string.IsNullOrEmpty(job.Project) ?
+                    null
+                    : await Git.CommitHashAsync(benchmarkedApp, cancellationToken);
+
+                job.Dependencies = GetDependencies(job, outputFolder, aspNetCoreVersion, runtimeVersion, projectGitCommitHash);
 
                 job.Dependencies.AddRange(knownDependencies);
 
                 CreateDependenciesHash();
             }
 
-            return benchmarkedDir;
+            return path;
 
             void CreateDependenciesHash()
             {
@@ -3464,7 +3496,7 @@ namespace Microsoft.Crank.Agent
                 }
             }
 
-            return Path.GetFileNameWithoutExtension(FormatPathSeparators(job.Source.Project));
+            return Path.GetFileNameWithoutExtension(FormatPathSeparators(job.Project));
         }
         private static string ResolveProjectTFM(Job job, string projectFileName, string targetFramework)
         {
@@ -3557,7 +3589,7 @@ namespace Microsoft.Crank.Agent
                             await PatchProjectFrameworkReferenceAsync(job, projectReference, targetFramework, processed);
                         }
                     }
-
+                    
                     // Remove existing <TargetFramework(s)> element
 
                     var targetFrameworksElements = project.Root.Elements("PropertyGroup").Elements("TargetFrameworks");
@@ -3626,9 +3658,19 @@ namespace Microsoft.Crank.Agent
                             new XElement("PackageReference",
                                 new XAttribute("Include", packageEntry.Key),
                                 new XAttribute("Version", packageEntry.Value)
-                                )
+                            )
                         );
                     }
+
+                    // Exclude "published" folder from content to prevent recursively copying it after each cached build
+                    project.Root.Add(
+                        new XElement("ItemGroup",
+                            new XElement("Content",
+                                new XAttribute("Update", "published\\**"),
+                                new XAttribute("CopyToPublishDirectory", "Never")
+                            )
+                        )
+                    );
 
                     using (var projectFileStream = File.CreateText(projectFileName))
                     {
@@ -3642,42 +3684,22 @@ namespace Microsoft.Crank.Agent
         {
             // Converting legacy values
 
-            if (runtimeVersion.EndsWith("*")) // 2.1.*, 2.*, 5.0.*
+            if (runtimeVersion.EndsWith("*")) // 6.0.*
             {
-                var major = int.Parse(runtimeVersion.Split('.')[0]);
-
-                if (major >= 5)
-                {
-                    targetFramework = "net" + runtimeVersion.Substring(0, 3);
-                }
-                else
-                {
-                    targetFramework = "netcoreapp" + runtimeVersion.Substring(0, 3);
-                }
-                
+                targetFramework = "net" + runtimeVersion.Substring(0, 3);
                 runtimeVersion = "edge";
             }
-            else if (runtimeVersion.Split('.').Length == 2) // 2.1, 5.0
+            else if (runtimeVersion.Split('.').Length == 2) // 6.0
             {
-                var major = int.Parse(runtimeVersion.Split('.')[0]);
-
-                if (major >= 5)
-                {
-                    targetFramework = "net" + runtimeVersion.Substring(0, 3);
-                }
-                else
-                {
-                    targetFramework = "netcoreapp" + runtimeVersion.Substring(0, 3);
-                }
-                
+                targetFramework = "net" + runtimeVersion.Substring(0, 3);
                 runtimeVersion = "current";
             }
 
-            if (aspNetCoreVersion.EndsWith("*")) // 2.1.*, 2.*
+            if (aspNetCoreVersion.EndsWith("*")) // 6.*
             {
                 aspNetCoreVersion = "edge";
             }
-            else if (aspNetCoreVersion.Split('.').Length == 2) // 2.1, 5.0
+            else if (aspNetCoreVersion.Split('.').Length == 2) // 6.0
             {
                 aspNetCoreVersion = "current";
             }
@@ -3719,6 +3741,10 @@ namespace Microsoft.Crank.Agent
                     // aspnet runtime service releases are not published on feeds
                     switch (versionPrefix)
                     {
+                        case "9.0":
+                            aspNetCoreVersion = await GetFlatContainerVersion(_aspnet9FlatContainerUrl, versionPrefix, checkDotnetInstallUrl: true);
+                            Log.Info($"ASP.NET: {aspNetCoreVersion} (Latest - From 9.0 feed)");
+                            break;
                         case "8.0":
                             aspNetCoreVersion = await GetFlatContainerVersion(_aspnet8FlatContainerUrl, versionPrefix, checkDotnetInstallUrl: true);
                             Log.Info($"ASP.NET: {aspNetCoreVersion} (Latest - From 8.0 feed)");
@@ -3730,10 +3756,6 @@ namespace Microsoft.Crank.Agent
                         case "6.0":
                             aspNetCoreVersion = await GetFlatContainerVersion(_aspnet6FlatContainerUrl, versionPrefix, checkDotnetInstallUrl: true);
                             Log.Info($"ASP.NET: {aspNetCoreVersion} (Latest - From 6.0 feed)");
-                            break;
-                        case "5.0":
-                            aspNetCoreVersion = await GetFlatContainerVersion(_aspnet5FlatContainerUrl, versionPrefix);
-                            Log.Info($"ASP.NET: {aspNetCoreVersion} (Latest - From 5.0 feed)");
                             break;
                         default:
                             aspNetCoreVersion = currentAspNetCoreVersion;
@@ -3851,8 +3873,8 @@ namespace Microsoft.Crank.Agent
 
                         if (informationalVersionAttribute != null)
                         {
-                            var argumentValule = informationalVersionAttribute.ConstructorArguments[0].Value.ToString();
-                            var versions = argumentValule.Split('+', 2, StringSplitOptions.RemoveEmptyEntries);
+                            var argumentValue = informationalVersionAttribute.ConstructorArguments[0].Value.ToString();
+                            var versions = argumentValue.Split('+', 2, StringSplitOptions.RemoveEmptyEntries);
 
                             dependency.Version = versions[0];
 
@@ -3927,18 +3949,6 @@ namespace Microsoft.Crank.Agent
                 {
                     projectDependency.CommitHash = projectHash;
                 }
-
-                if (!String.IsNullOrEmpty(job.Source.Repository))
-                {
-                    projectDependency.RepositoryUrl = job.Source.Repository;
-
-                    // Remove trailing .git from repository url
-                    if (projectDependency.RepositoryUrl.EndsWith(".git", StringComparison.OrdinalIgnoreCase)
-                        && projectDependency.RepositoryUrl.Contains("github.com", StringComparison.OrdinalIgnoreCase))
-                    {
-                        projectDependency.RepositoryUrl = projectDependency.RepositoryUrl[0..^4];
-                    }
-                }
             }
 
             // Group by repository/hash/hash, then reduce names
@@ -3959,7 +3969,7 @@ namespace Microsoft.Crank.Agent
 
             bool IsProjectAssembly(Dependency d)
             {
-                return d.Names.Any(x => Path.GetFileNameWithoutExtension(x) == Path.GetFileNameWithoutExtension(job.Source.Project ?? ""));
+                return d.Names.Any(x => Path.GetFileNameWithoutExtension(x) == Path.GetFileNameWithoutExtension(job.Project ?? ""));
             }
 
             bool IsAspNetCoreDependency(Dependency d)
@@ -4020,7 +4030,7 @@ namespace Microsoft.Crank.Agent
             File.WriteAllText(runtimeConfigFilename, runtimeObject.ToString());
         }
 
-        private static async Task<string> ResolveSdkVersion(string sdkVersion, string currentSdkVersion)
+        private static async Task<string> ResolveSdkVersion(string sdkVersion, string currentSdkVersion, string targetFramework)
         {
             if (String.Equals(sdkVersion, "Current", StringComparison.OrdinalIgnoreCase))
             {
@@ -4034,8 +4044,16 @@ namespace Microsoft.Crank.Agent
             }
             else if (String.Equals(sdkVersion, "Edge", StringComparison.OrdinalIgnoreCase))
             {
-                (sdkVersion, _) = await ParseVersionsFile(_latestSdkVersionUrl, "installer");
-                Log.Info($"SDK: {sdkVersion} (Edge)");
+                if (targetFramework == "net9.0")
+                {
+                    (sdkVersion, _) = await ParseVersionsFile(_latestSdk90VersionUrl, "installer");
+                    Log.Info($"SDK: {sdkVersion} (Edge)");
+                }
+                else
+                {
+                    (sdkVersion, _) = await ParseVersionsFile(_latestSdk80VersionUrl, "installer");
+                    Log.Info($"SDK: {sdkVersion} (Edge)");
+                }
             }
             else
             {
@@ -4065,7 +4083,12 @@ namespace Microsoft.Crank.Agent
 
                 var versionPrefix = targetFramework.Substring(targetFramework.Length - 3);
 
-                if (versionPrefix == "8.0")
+                if (versionPrefix == "9.0")
+                {
+                    runtimeVersion = await GetFlatContainerVersion(_netcore9FlatContainerUrl, versionPrefix, checkDotnetInstallUrl: true);
+                    Log.Info($"Runtime: {runtimeVersion} (Latest - From 9.0 feed)");
+                }
+                else if (versionPrefix == "8.0")
                 {
                     runtimeVersion = await GetFlatContainerVersion(_netcore8FlatContainerUrl, versionPrefix, checkDotnetInstallUrl: true);
                     Log.Info($"Runtime: {runtimeVersion} (Latest - From 8.0 feed)");
@@ -4079,11 +4102,6 @@ namespace Microsoft.Crank.Agent
                 {
                     runtimeVersion = await GetFlatContainerVersion(_netcore6FlatContainerUrl, versionPrefix, checkDotnetInstallUrl: true);
                     Log.Info($"Runtime: {runtimeVersion} (Latest - From 6.0 feed)");
-                }
-                else if (versionPrefix == "5.0")
-                {
-                    runtimeVersion = await GetFlatContainerVersion(_netcore5FlatContainerUrl, versionPrefix);
-                    Log.Info($"Runtime: {runtimeVersion} (Latest - From 5.0 feed)");
                 }
                 else
                 {
@@ -4100,8 +4118,10 @@ namespace Microsoft.Crank.Agent
             return runtimeVersion;
         }
 
-        private static async Task<string> ResolveDestopVersion(string desktopVersion, string currentDesktopVersion)
+        private static async Task<string> ResolveDesktopVersion(string desktopVersion, string currentDesktopVersion, string targetFramework)
         {
+            var latestSdkUrl = targetFramework == "net9.0" ? _latestSdk90VersionUrl : _latestSdk80VersionUrl;
+
             if (String.Equals(desktopVersion, "Current", StringComparison.OrdinalIgnoreCase))
             {
                 desktopVersion = currentDesktopVersion;
@@ -4114,7 +4134,7 @@ namespace Microsoft.Crank.Agent
             }
             else if (String.Equals(desktopVersion, "Edge", StringComparison.OrdinalIgnoreCase))
             {
-                (desktopVersion, _) = await ParseVersionsFile(_latestSdkVersionUrl, "windowsdesktop");
+                (desktopVersion, _) = await ParseVersionsFile(latestSdkUrl, "windowsdesktop");
                 Log.Info($"Desktop: {currentDesktopVersion} (Edge)");
             }
             else
@@ -4144,72 +4164,12 @@ namespace Microsoft.Crank.Agent
 
             switch (targetFramework)
             {
-                case "netcoreapp2.1":
-
-                    await DownloadFileAsync(String.Format(_aspNetCoreDependenciesUrl, "release/2.1/build/dependencies.props"), aspNetCoreDependenciesPath, maxRetries: 5, timeout: 10);
-                    latestRuntimeVersion = XDocument.Load(aspNetCoreDependenciesPath).Root
-                        .Elements("PropertyGroup")
-                        .Select(x => x.Element("MicrosoftNETCoreAppPackageVersion"))
-                        .Where(x => x != null)
-                        .FirstOrDefault()
-                        .Value;
-
-                    break;
-
-                case "netcoreapp2.2":
-
-                    await DownloadFileAsync(String.Format(_aspNetCoreDependenciesUrl, "release/2.2/build/dependencies.props"), aspNetCoreDependenciesPath, maxRetries: 5, timeout: 10);
-                    latestRuntimeVersion = XDocument.Load(aspNetCoreDependenciesPath).Root
-                        .Elements("PropertyGroup")
-                        .Select(x => x.Element("MicrosoftNETCoreAppPackageVersion"))
-                        .Where(x => x != null)
-                        .FirstOrDefault()
-                        .Value;
-
-                    break;
-
-                case "netcoreapp3.0":
-
-                    await DownloadFileAsync(String.Format(_aspNetCoreDependenciesUrl, "release/3.0/eng/Versions.props"), aspNetCoreDependenciesPath, maxRetries: 5, timeout: 10);
-                    latestRuntimeVersion = XDocument.Load(aspNetCoreDependenciesPath).Root
-                        .Elements("PropertyGroup")
-                        .Select(x => x.Element("MicrosoftNETCoreAppRefPackageVersion"))
-                        .Where(x => x != null)
-                        .FirstOrDefault()
-                        .Value;
-
-                    break;
-
-                case "netcoreapp3.1":
-
-                    await DownloadFileAsync(String.Format(_aspNetCoreDependenciesUrl, "release/3.1/eng/Versions.props"), aspNetCoreDependenciesPath, maxRetries: 5, timeout: 10);
-                    latestRuntimeVersion = XDocument.Load(aspNetCoreDependenciesPath).Root
-                        .Elements("PropertyGroup")
-                        .Select(x => x.Element("MicrosoftNETCoreAppRuntimewinx64PackageVersion"))
-                        .Where(x => x != null)
-                        .FirstOrDefault()
-                        .Value;
-
-                    break;
-
-                case "net5.0":
-
-                    await DownloadFileAsync(String.Format(_aspNetCoreDependenciesUrl, "release/5.0/eng/Versions.props"), aspNetCoreDependenciesPath, maxRetries: 5, timeout: 10);
-                    latestRuntimeVersion = XDocument.Load(aspNetCoreDependenciesPath).Root
-                        .Elements("PropertyGroup")
-                        .Select(x => x.Element("MicrosoftNETCoreAppRuntimewinx64PackageVersion"))
-                        .Where(x => x != null)
-                        .FirstOrDefault()
-                        .Value;
-
-                    break;
-
                 case "net6.0":
 
                     await DownloadFileAsync(String.Format(_aspNetCoreDependenciesUrl, "release/6.0/eng/Versions.props"), aspNetCoreDependenciesPath, maxRetries: 5, timeout: 10);
                     latestRuntimeVersion = XDocument.Load(aspNetCoreDependenciesPath).Root
                         .Elements("PropertyGroup")
-                        .Select(x => x.Element("MicrosoftNETCoreAppRuntimewinx64PackageVersion"))
+                        .Select(x => x.Element("MicrosoftNETCoreAppRuntimewinx64Version"))
                         .Where(x => x != null)
                         .FirstOrDefault()
                         .Value;
@@ -4221,7 +4181,7 @@ namespace Microsoft.Crank.Agent
                     await DownloadFileAsync(String.Format(_aspNetCoreDependenciesUrl, "release/7.0/eng/Versions.props"), aspNetCoreDependenciesPath, maxRetries: 5, timeout: 10);
                     latestRuntimeVersion = XDocument.Load(aspNetCoreDependenciesPath).Root
                         .Elements("PropertyGroup")
-                        .Select(x => x.Element("MicrosoftNETCoreAppRuntimewinx64PackageVersion"))
+                        .Select(x => x.Element("MicrosoftNETCoreAppRuntimewinx64Version"))
                         .Where(x => x != null)
                         .FirstOrDefault()
                         .Value;
@@ -4230,15 +4190,27 @@ namespace Microsoft.Crank.Agent
 
                 case "net8.0":
 
-                    await DownloadFileAsync(String.Format(_aspNetCoreDependenciesUrl, "main/eng/Versions.props"), aspNetCoreDependenciesPath, maxRetries: 5, timeout: 10);
+                    await DownloadFileAsync(String.Format(_aspNetCoreDependenciesUrl, "release/8.0/eng/Versions.props"), aspNetCoreDependenciesPath, maxRetries: 5, timeout: 10);
                     latestRuntimeVersion = XDocument.Load(aspNetCoreDependenciesPath).Root
                         .Elements("PropertyGroup")
-                        .Select(x => x.Element("MicrosoftNETCoreAppRuntimewinx64PackageVersion"))
+                        .Select(x => x.Element("MicrosoftNETCoreAppRuntimewinx64Version"))
                         .Where(x => x != null)
                         .FirstOrDefault()
                         .Value;
 
-                    break;                    
+                    break;
+
+                case "net9.0":
+
+                    await DownloadFileAsync(String.Format(_aspNetCoreDependenciesUrl, "main/eng/Versions.props"), aspNetCoreDependenciesPath, maxRetries: 5, timeout: 10);
+                    latestRuntimeVersion = XDocument.Load(aspNetCoreDependenciesPath).Root
+                        .Elements("PropertyGroup")
+                        .Select(x => x.Element("MicrosoftNETCoreAppRuntimewinx64Version"))
+                        .Where(x => x != null)
+                        .FirstOrDefault()
+                        .Value;
+
+                    break;
             }
 
             Log.Info($"Detecting AspNetCore repository runtime version: {latestRuntimeVersion}");
@@ -4250,14 +4222,14 @@ namespace Microsoft.Crank.Agent
         /// </summary>
         private static async Task<(string Runtime, string Desktop, string AspNet, string Sdk)> GetCurrentVersions(string targetFramework)
         {
-            // There are currently no release for net8.0
+            // There are currently no release for net9.0
             // Remove once there is at least a preview and a "release-metadata" file
-            if (targetFramework.Equals("net8.0", StringComparison.OrdinalIgnoreCase))
+            if (targetFramework.Equals("net9.0", StringComparison.OrdinalIgnoreCase))
             {
                 return (null, null, null, null);
             }
 
-            var frameworkVersion = targetFramework.Substring(targetFramework.Length - 3); // 3.1
+            var frameworkVersion = targetFramework.Substring(targetFramework.Length - 3); // 6.0
             var metadataUrl = $"https://dotnetcli.blob.core.windows.net/dotnet/release-metadata/{frameworkVersion}/releases.json";
 
             try
@@ -4469,8 +4441,8 @@ namespace Microsoft.Crank.Agent
 
         private static async Task<Process> StartProcess(string hostname, string benchmarksRepo, Job job, string dotnetHome, JobContext context)
         {
-            var workingDirectory = !String.IsNullOrEmpty(job.Source.Project)
-                ? Path.Combine(benchmarksRepo, Path.GetDirectoryName(FormatPathSeparators(job.Source.Project)))
+            var workingDirectory = !String.IsNullOrEmpty(job.Project)
+                ? Path.Combine(benchmarksRepo, Path.GetDirectoryName(FormatPathSeparators(job.Project)))
                 : benchmarksRepo
                 ;
 
@@ -4478,7 +4450,7 @@ namespace Microsoft.Crank.Agent
             var serverUrl = $"{scheme}://{hostname}:{job.Port}";
             var executable = GetDotNetExecutable(dotnetHome);
 
-            var projectFileName = Path.Combine(benchmarksRepo, FormatPathSeparators(job.Source.Project));
+            var projectFileName = Path.Combine(benchmarksRepo, FormatPathSeparators(job.Project));
             var assemblyName = GetAssemblyName(job, projectFileName);
 
             var benchmarksDll = !String.IsNullOrEmpty(assemblyName)
@@ -4497,22 +4469,6 @@ namespace Microsoft.Crank.Agent
 
             var commandLine = benchmarksDll ?? "";
 
-            if (job.SelfContained)
-            {
-                workingDirectory = Path.Combine(workingDirectory, "published");
-
-                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-                {
-                    executable = Path.Combine(workingDirectory, $"{assemblyName}.exe");
-                }
-                else
-                {
-                    executable = Path.Combine(workingDirectory, assemblyName);
-                }
-
-                commandLine = "";
-            }
-
             if (!String.IsNullOrEmpty(job.Executable))
             {
                 executable = job.Executable;
@@ -4526,6 +4482,21 @@ namespace Microsoft.Crank.Agent
                     // we need the full path to run this, as it is not in the path
                     executable = Path.Combine(workingDirectory, executable);
                 }
+            }
+            else if (job.SelfContained)
+            {
+                workingDirectory = Path.Combine(workingDirectory, "published");
+
+                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                {
+                    executable = Path.Combine(workingDirectory, $"{assemblyName}.exe");
+                }
+                else
+                {
+                    executable = Path.Combine(workingDirectory, assemblyName);
+                }
+
+                commandLine = "";
             }
 
             job.BasePath = workingDirectory;
@@ -4554,56 +4525,15 @@ namespace Microsoft.Crank.Agent
 
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux) && (job.MemoryLimitInBytes > 0 || job.CpuLimitRatio > 0 || !String.IsNullOrEmpty(job.CpuSet)))
             {
-                var controller = GetCGroupController(job);
-
-                var cgcreate = await ProcessUtil.RunAsync("cgcreate", $"-g memory,cpu,cpuset:{controller}", log: true);
-
-                if (cgcreate.ExitCode > 0)
+                if (CGroupVersion == null)
                 {
-                    job.Error += "Could not create cgroup";
-                    return null;
+                    CGroupVersion = await CGroup.GetCGroupVersionAsync();
                 }
 
-                if (job.MemoryLimitInBytes > 0)
-                {
-                    await ProcessUtil.RunAsync("cgset", $"-r memory.limit_in_bytes={job.MemoryLimitInBytes} {controller}", log: true);
-                }
-                else
-                {
-                    await ProcessUtil.RunAsync("cgset", $"-r memory.limit_in_bytes=-1 {controller}", log: true);
-                }
+                var (cgExec, cgArg) = await CGroupVersion.CreateAsync(job);
 
-                if (job.CpuLimitRatio > 0)
-                {
-                    // Ensure the cfs_period_us is the same as what docker would use
-                    await ProcessUtil.RunAsync("cgset", $"-r cpu.cfs_period_us={_defaultDockerCfsPeriod} {controller}", log: true);
-                    await ProcessUtil.RunAsync("cgset", $"-r cpu.cfs_quota_us={Math.Floor(job.CpuLimitRatio * _defaultDockerCfsPeriod)} {controller}", log: true);
-                }
-                else
-                {
-                    await ProcessUtil.RunAsync("cgset", $"-r cpu.cfs_quota_us=-1 {controller}", log: true);
-                }
-
-
-                if (!String.IsNullOrEmpty(job.CpuSet))
-                {
-
-                    await ProcessUtil.RunAsync("cgset", $"-r cpuset.cpus={job.CpuSet} {controller}", log: true);
-                }
-                else
-                {
-                    await ProcessUtil.RunAsync("cgset", $"-r cpuset.cpus=0-{Environment.ProcessorCount - 1} {controller}", log: true);
-                }
-
-                // The cpuset.mems value for the 'benchmarks' controller needs to match the root one
-                // to be compatible with the allowed nodes
-                var memsRoot = File.ReadAllText("/sys/fs/cgroup/cpuset/cpuset.mems");
-
-                // Both cpus and mems need to be initialized
-                await ProcessUtil.RunAsync("cgset", $"-r cpuset.mems={memsRoot} {controller}", log: true);
-
-                commandLine = $"-g memory,cpu,cpuset:{controller} {executable} {commandLine}";
-                executable = "cgexec";
+                commandLine = $"{cgArg} {executable} {commandLine}";
+                executable = cgExec;
             }
 
             Log.Info($"Invoking executable: {executable}");
@@ -4727,42 +4657,16 @@ namespace Microsoft.Crank.Agent
                 RunAndTrace();
             }
 
-            if ((job.MemoryLimitInBytes > 0 || !String.IsNullOrWhiteSpace(job.CpuSet)) && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            if ((job.MemoryLimitInBytes > 0 || job.CpuLimitRatio > 0 || !String.IsNullOrWhiteSpace(job.CpuSet)) && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
-                var safeProcess = Kernel32.OpenProcess(ACCESS_MASK.MAXIMUM_ALLOWED, false, (uint)process.Id);
+                var limiter = new WindowsLimiter(job, (uint)process.Id);
 
-                if (job.MemoryLimitInBytes > 0)
+                limiter.LimitProcess();
+
+                process.Exited += (sender, e) =>
                 {
-                    Log.Info($"Creating Job Object with memory limits: {job.MemoryLimitInBytes / 1024 / 1024:n0} MB");
-
-                    var hJob = Kernel32.CreateJobObject(null, job.RunId);
-                    var bi = Kernel32.QueryInformationJobObject<Kernel32.JOBOBJECT_EXTENDED_LIMIT_INFORMATION>(hJob, Kernel32.JOBOBJECTINFOCLASS.JobObjectExtendedLimitInformation);
-                    bi.BasicLimitInformation.LimitFlags |= Kernel32.JOBOBJECT_LIMIT_FLAGS.JOB_OBJECT_LIMIT_JOB_MEMORY;
-                    bi.JobMemoryLimit = job.MemoryLimitInBytes;
-
-                    Kernel32.SetInformationJobObject(hJob, Kernel32.JOBOBJECTINFOCLASS.JobObjectExtendedLimitInformation, bi);
-                    Kernel32.AssignProcessToJobObject(hJob, safeProcess);
-
-                    process.Exited += (sender, e) =>
-                    {
-                        Log.Info("Releasing job object");
-                        Kernel32.TerminateJobObject(hJob, 0);
-                        safeProcess.Dispose();
-                    };
-                }
-
-                if (!String.IsNullOrWhiteSpace(job.CpuSet))
-                {
-                    var cpuSet = CalculateCpuList(job.CpuSet);
-
-                    var ssi = Kernel32.GetSystemCpuSetInformation(safeProcess).ToArray();
-                    var cpuSets = cpuSet.Select(i => ssi[i].CpuSet.Id).ToArray();
-
-                    Log.Info($"Limiting CpuSet ids: {String.Join(',', cpuSets)}");
-
-                    var result = Kernel32.SetProcessDefaultCpuSets(safeProcess, cpuSets, (uint)cpuSets.Length);
-                }              
-                
+                    limiter.Dispose();
+                };
             }
 
             // We try to detect an endpoint is ready if we are running in IIS (no console logs)
@@ -4822,12 +4726,6 @@ namespace Microsoft.Crank.Agent
             }
 
             return result;
-        }
-
-        private static string GetCGroupController(Job job)
-        {
-            // Create a unique cgroup controller per agent
-            return $"benchmarks-{Environment.ProcessId}-{job.Id}";
         }
 
         private static async Task StartCountersAsync(Job job, JobContext context)
@@ -5149,7 +5047,7 @@ namespace Microsoft.Crank.Agent
             await context.CountersTask;
 
             // The event pipe session needs to be disposed after the source is interrupted
-            context.EventPipeSession.Dispose();
+            context.EventPipeSession?.Dispose();
             context.EventPipeSession = null;
 
             Log.Info($"Event pipes terminated ({job.Service}:{job.Id})");
@@ -5627,6 +5525,11 @@ namespace Microsoft.Crank.Agent
 
         private static string GetRepoName(Source source)
         {
+            if (string.IsNullOrEmpty(source.Repository))
+            {
+                return "";
+            }
+
             // Attempt to parse a string like
             // - http://<host>.com/<user>/<repo>.git OR
             // - http://<host>.com/<user>/<repo>
@@ -5706,8 +5609,8 @@ namespace Microsoft.Crank.Agent
             const string internalFeed = "https://dotnetbuilds.azureedge.net/public";
             const string publicFeed = "https://dotnetcli.azureedge.net/dotnet";
             
-            var dotnetFeeds = version.StartsWith("8.0")
-                ? new string[] { internalFeed, publicFeed } // for 8.0 we check on the internal feed first
+            var dotnetFeeds = version.StartsWith("8.0") || version.StartsWith("9.0")
+                ? new string[] { internalFeed, publicFeed } // for vnext and preview versions we check on the internal feed first
                 : new string[] { publicFeed, internalFeed } // for older versions odds are that we are looking for a public package
                 ;
 
@@ -5834,6 +5737,55 @@ namespace Microsoft.Crank.Agent
             }
         }
 
+        private static void SendCtrlCSignalToProcess(Process process)
+        {
+            try
+            {
+                // Prevent concurrent apps from removing the CTRL handler
+                lock (_consoleLock)
+                {
+                    if (process != null && !process.HasExited)
+                    {
+                        // Prevent the agent process from stopping because of Ctrl + C event with SetConsoleCtrlHandler.
+                        // This removes the console CTRL handler.
+
+                        SetConsoleCtrlHandler(null, true);
+                        try
+                        {
+                            // Generate console event for current console with GenerateConsoleCtrlEvent (processGroupId should be zero).
+                            // Only the benchmarked apps are attached to the console at this point.
+                            GenerateConsoleCtrlEvent(CtrlTypes.CTRL_C_EVENT, 0);
+
+                            // Wait for the process to finish (give it up to 20 seconds)
+                            if (process.WaitForExit(20000))
+                            {
+                                Log.Info("Process has exited");
+                            }
+                            else
+                            {
+                                Log.Info("Process did not exit from the CTRL+C");
+                            }
+                        }
+                        finally
+                        {
+                            // Restore the console CTRL handler of the agent
+                            SetConsoleCtrlHandler(null, false);
+                        }
+                    }
+                    else
+                    {
+                        Log.Info("Skipping signal since process has already exited");
+                    }
+                }
+            }
+            catch (Exception exception)
+            {
+                // InvalidOperationException is thrown when there is no process associated to the process object. 
+                // There is no process to kill, Log the exception and shutdown the service. 
+                Log.Error(exception);
+            }
+        }
+
         public enum ErrorModes : uint
         {
             SYSTEM_DEFAULT = 0x0,
@@ -5858,10 +5810,6 @@ namespace Microsoft.Crank.Agent
         enum CtrlTypes
         {
             CTRL_C_EVENT = 0,
-            CTRL_BREAK_EVENT,
-            CTRL_CLOSE_EVENT,
-            CTRL_LOGOFF_EVENT = 5,
-            CTRL_SHUTDOWN_EVENT
         }
 
         /// <param name="providers">
@@ -6008,16 +5956,14 @@ namespace Microsoft.Crank.Agent
                 File.WriteAllText(rootNugetConfig, @"<?xml version=""1.0"" encoding=""utf-8""?>
 <configuration>
   <packageSources>
+    <add key=""benchmarks-dotnet9"" value=""https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet9/nuget/v3/index.json"" />
+    <add key=""benchmarks-dotnet9-transport"" value=""https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet9-transport/nuget/v3/index.json"" />
     <add key=""benchmarks-dotnet8"" value=""https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet8/nuget/v3/index.json"" />
     <add key=""benchmarks-dotnet8-transport"" value=""https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet8-transport/nuget/v3/index.json"" />
     <add key=""benchmarks-dotnet7"" value=""https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet7/nuget/v3/index.json"" />
     <add key=""benchmarks-dotnet7-transport"" value=""https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet7-transport/nuget/v3/index.json"" />
     <add key=""benchmarks-dotnet6"" value=""https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet6/nuget/v3/index.json"" />
     <add key=""benchmarks-dotnet6-transport"" value=""https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet6-transport/nuget/v3/index.json"" />
-    <add key=""benchmarks-dotnet5"" value=""https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet5/nuget/v3/index.json"" />
-    <add key=""benchmarks-dotnet5-transport"" value=""https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet5-transport/nuget/v3/index.json"" />
-    <add key=""benchmarks-dotnet3.1"" value=""https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet3.1/nuget/v3/index.json"" />
-    <add key=""benchmarks-dotnet3.1-transport"" value=""https://pkgs.dev.azure.com/dnceng/public/_packaging/dotnet3.1-transport/nuget/v3/index.json"" />
     <add key=""benchmarks-aspnetcore"" value=""https://dotnetfeed.blob.core.windows.net/aspnet-aspnetcore/index.json"" />
     <add key=""benchmarks-dotnet-core"" value=""https://dotnetfeed.blob.core.windows.net/dotnet-core/index.json"" />
     <add key=""benchmarks-extensions"" value=""https://dotnetfeed.blob.core.windows.net/aspnet-extensions/index.json"" />

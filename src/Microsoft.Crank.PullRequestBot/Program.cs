@@ -261,6 +261,8 @@ namespace Microsoft.Crank.PullRequestBot
 
                     if (options.PublishResults)
                     {
+                        Console.WriteLine("Publishing results");
+
                         var text = new StringBuilder();
 
                         foreach (var result in results)
@@ -272,7 +274,18 @@ namespace Microsoft.Crank.PullRequestBot
 
                         var issueComment = await _githubClient.Issue.Comment.Create(owner, name, command.PullRequest.Number, ApplyThumbprint(text.ToString()));
 
-                        Console.WriteLine($"Results published at {issueComment.HtmlUrl}");
+                        if (issueComment != null)
+                        {
+                            Console.WriteLine($"Results published at {issueComment.HtmlUrl}");
+                        }
+                        else
+                        {
+                            Console.WriteLine($"Error while publishing a result {owner}/{name}/{command.PullRequest.Number}");
+                        }
+                    }
+                    else
+                    {
+                        Console.WriteLine("Skipping publishing results.");
                     }
                 }
                 catch (Exception ex)
@@ -328,13 +341,13 @@ namespace Microsoft.Crank.PullRequestBot
                                     text.AppendLine(FormatResult(result));
                                 }
 
-                                Console.WriteLine($"Creating result:\n{text}");
+                                await UpgradeAuthenticatedClient();
 
                                 var newComment = await _githubClient.Issue.Comment.Create(owner, name, command.PullRequest.Number, ApplyThumbprint(text.ToString()));
 
                                 if (newComment != null)
                                 {
-                                    Console.WriteLine($"Result published for {owner}/{name}/{command.PullRequest.Number}");
+                                    Console.WriteLine($"Results published at {newComment.HtmlUrl}");
                                 }
                                 else
                                 {
@@ -343,7 +356,7 @@ namespace Microsoft.Crank.PullRequestBot
                             }
                             catch (Exception ex)
                             {
-                                Console.WriteLine($"An error occured: {ex}");
+                                Console.WriteLine($"An error occurred: {ex}");
                             }
                         }
                         else
@@ -355,7 +368,7 @@ namespace Microsoft.Crank.PullRequestBot
                     {
                         var errorCommentText = $"Failed to benchmark PR #{command.PullRequest.Number}. Skipping... Details:\n```\n{ex}\n```";
                         Console.WriteLine($"Benchmark error comment: {errorCommentText}");
-                        await _githubClient.Issue.Comment.Create(owner, name, command.PullRequest.Number, ApplyThumbprint("An error occured, please check the logs"));
+                        await _githubClient.Issue.Comment.Create(owner, name, command.PullRequest.Number, ApplyThumbprint("An error occurred, please check the logs"));
                     }
                 }
 
@@ -860,15 +873,6 @@ namespace Microsoft.Crank.PullRequestBot
                 // This assumes dotnet is part of the PATH, which might not work based on the host
 
                 await ProcessUtil.RunAsync(@"dotnet", "build-server shutdown", log: true, throwOnError: false);
-
-                if (Environment.OSVersion.Platform == PlatformID.Unix)
-                {
-                    await ProcessUtil.RunAsync("sh", "-c \"pkill dotnet || true\"", log: true, throwOnError: false);
-                }
-                else if (Environment.OSVersion.Platform == PlatformID.Win32NT)
-                {
-                    await ProcessUtil.RunAsync(@"taskkill", "/F /IM dotnet.exe", log: true, throwOnError: false);
-                }
 
                 // Clean git clones
                 try
